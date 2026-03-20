@@ -1,5 +1,4 @@
 # mr-cerebral-artery-research-release
-mr-cerebral-artery-research-release
 
 This repository contains the core implementation and demo assets for reproducing the research described in the manuscript:
 
