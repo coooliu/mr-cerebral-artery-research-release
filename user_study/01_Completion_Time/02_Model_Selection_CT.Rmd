@@ -1,0 +1,114 @@
+---
+title: "Completion Time : Model Selection"
+author: "CongLiu"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    word_document: default
+    pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5,
+  fig.align = "center",
+  dpi = 300
+)
+
+suppressPackageStartupMessages({
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(nlme)
+library(performance)
+})
+```
+
+## 1. Data import and preprocessing
+```{r data}
+# ---- Data location ----
+# The raw dataset is stored outside this analysis folder (e.g., in a sibling directory).
+# If your folder layout differs, update `candidate_dirs` below.
+data_file <- "Experimental_Raw_Data.csv"
+candidate_dirs <- c(
+  file.path("..", "data"),
+  file.path("..", "datasets"),
+  ".."
+)
+candidate_paths <- file.path(candidate_dirs, data_file)
+data_path <- candidate_paths[file.exists(candidate_paths)][1]
+
+if (is.na(data_path)) {
+  stop("Data file not found. Checked:
+  - ", paste(candidate_paths, collapse = "
+  - "))
+}
+
+dat <- readr::read_csv(data_path, show_col_types = FALSE) %>% 
+  mutate(
+    group       = factor(group, levels = c("3D-only","2D+3D")),
+    complexity  = factor(complexity, levels = c("simple","complex")),
+    participant = factor(participant),
+    log_ct      = log(completion_time)
+  )
+```
+
+## 2. Candidate model specification and fitting
+| Model ID | Random-effects structure | Heteroscedasticity | Implementation |
+|---------|----------|--------|------|
+| **M0**  | (1 &#124; participant) | No | `lmer` |
+| **M1**  | (1 + complexity &#124; participant) | No | `lmer` |
+| **M2**  | (1 &#124; participant) | varIdent(~1 &#124; complexity) | `nlme::lme` |
+| **M3**  | (1 + complexity &#124; participant) | varIdent(~1 &#124; complexity) | `nlme::lme` |
+
+```{r models}
+# M0: random intercept
+m0 <- lmer(log_ct ~ group * complexity + (1 | participant), data = dat, REML = TRUE)
+
+# M1: random slope
+m1 <- lmer(log_ct ~ group * complexity + (1 + complexity | participant), data = dat, REML = TRUE)
+
+# M2: heteroscedastic (by complexity)
+m2 <- lme(log_ct ~ group * complexity,
+          random  = ~1 | participant,
+          weights = varIdent(form = ~1 | complexity),
+          data = dat,
+          method = "REML")
+
+# M3: random slope + heteroscedastic
+m3 <- lme(log_ct ~ group * complexity,
+          random  = ~1 + complexity | participant,
+          weights = varIdent(form = ~1 | complexity),
+          data = dat,
+          control = lmeControl(returnObject = TRUE),
+          method = "REML")
+```
+
+## 3. Model comparison
+```{r compare}
+models <- list(M0 = m0, M1 = m1, M2 = m2, M3 = m3)
+performance::compare_performance(models, rank = TRUE)
+```
+
+```{r aic}
+AICtab <- data.frame(
+  Model = names(models),
+  AIC   = sapply(models, AIC),
+  BIC   = sapply(models, BIC)
+)
+knitr::kable(AICtab, digits = 1)
+```
+
+## 4. Diagnostics (best model: M2)
+```{r diag}
+performance::check_model(m2)
+```
+
+> **Decision.** Based on `compare_performance` and AIC/BIC, **M2** achieved the best overall performance; therefore, all subsequent analyses use **M2** (random intercepts with a complexity-specific variance structure).

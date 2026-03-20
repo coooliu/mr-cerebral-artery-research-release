@@ -1,0 +1,248 @@
+---
+title: "Head Movement: Data Exploration and Diagnostics (Raw vs Log Scale)"
+params:
+  data_path: "Experimental_Raw_Data.csv"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5,
+  fig.align = "center",
+  dpi = 300,
+  out.width = "90%",
+  collapse = TRUE,
+  comment = "#>"
+)
+options(width = 120)
+set.seed(2025)
+
+# ------------------------------------------------------------------------------
+# Publication-ready data I/O helper
+#   - By default, the analysis looks for the data file *outside* this folder,
+#     e.g., in ../data/, ../datasets/, or the parent directory.
+#   - You can always override `params$data_path` with an absolute/relative path.
+# ------------------------------------------------------------------------------
+resolve_data_path <- function(
+  x,
+  candidate_dirs = c("../data", "../datasets", "../dataset", "../raw", "../input", "..")
+) {
+  if (!is.null(x) && nzchar(x) && file.exists(x)) return(x)
+
+  fname <- basename(x)
+  candidates <- unique(c(x, file.path(candidate_dirs, fname)))
+
+  for (p in candidates) {
+    if (!is.null(p) && nzchar(p) && file.exists(p)) return(p)
+  }
+
+  stop(
+    "Data file not found.
+",
+    "Provided: ", x, "
+",
+    "Checked paths:
+- ", paste(candidates, collapse = "
+- ")
+  )
+}
+```
+
+
+# 0. Packages and helper functions
+
+```{r}
+need <- c("tidyverse","janitor","readr","dplyr","stringr","forcats","ggplot2","ggpubr",
+          "lme4","nlme","emmeans","broom.mixed","car","moments","patchwork","knitr","kableExtra")
+to_install <- setdiff(need, rownames(installed.packages()))
+if(length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+
+suppressPackageStartupMessages({
+  library(tidyverse); library(janitor); library(readr); library(dplyr); library(stringr); library(forcats)
+  library(ggplot2); library(ggpubr); library(lme4); library(nlme); library(emmeans); library(broom.mixed)
+  library(car); library(moments); library(patchwork); library(knitr); library(kableExtra)
+})
+
+coalesce_col <- function(df, patterns, new){
+  hit <- names(df)[str_detect(names(df), regex(paste0("(", paste(patterns, collapse="|"), ")"), ignore_case=TRUE))]
+  if(length(hit) == 0) return(df)
+  df %>% rename(!!new := all_of(hit[1]))
+}
+```
+
+# 1. Data import and standardisation
+
+```{r}
+# Resolve data file location
+data_path <- resolve_data_path(params$data_path)
+raw <- readr::read_csv(data_path, show_col_types = FALSE) %>% janitor::clean_names()
+
+# Try to automatically map key columns
+df <- raw %>%
+  coalesce_col(c("^participant$","^subj","^pid","^ppid"), "participant") %>%
+  coalesce_col(c("^group$","condition","interact","arm"), "group") %>%
+  coalesce_col(c("^complexity$","path_complex","task_complexity","simple|complex"), "complexity") %>%
+  coalesce_col(c("^head_?move","head.?movement","head.*mov","hm", "head_move_dist"), "head_move")
+
+stopifnot(all(c("participant","group","complexity","head_move") %in% names(df)))
+
+df <- df %>%
+  mutate(
+    participant = factor(participant),
+    # Use inline (?i) to make regex case-insensitive (compatibility with older stringr versions)
+    group = as.factor(group) %>% fct_relabel(\(x) ifelse(str_detect(x, regex("2D", ignore_case=TRUE)), "2D+3D", "3D-only")) %>%
+              fct_relevel("3D-only", "2D+3D"),
+    complexity = as.factor(complexity) %>% fct_relabel(\(x) ifelse(str_detect(x, regex("complex", ignore_case=TRUE)), "complex", "simple")) %>%
+                 fct_relevel("simple", "complex"),
+    cell = interaction(group, complexity, sep = "·")
+  ) %>%
+  mutate(head_move = as.numeric(head_move))
+
+# Overall summary
+overall_summary <- tibble(
+  n_rows = nrow(df),
+  n_participants = n_distinct(df$participant)
+)
+
+# Number of participants per group
+group_summary <- df %>% 
+  distinct(participant, group) %>% 
+  count(group, name = "n_participants") %>%
+  rename(Group = group, Participants = n_participants)
+
+# Trial counts by complexity
+complexity_summary <- df %>% 
+  count(complexity, name = "n_trials") %>%
+  rename(Complexity = complexity, trialCount = n_trials)
+
+# Distribution of trial counts per participant (reporting summary statistics)
+trials_per_participant_summary <- df %>% 
+  count(participant, name = "n_trials") %>% 
+  summarize(
+    `Mean trials` = mean(n_trials), 
+    `Min trials` = min(n_trials),
+    `Max trials` = max(n_trials),
+    `SD trials` = sd(n_trials)
+  )
+
+# Print all summaries
+cat("Overall dataset overview:\n")
+print(overall_summary)
+
+cat("\nParticipants per group:\n")
+print(group_summary)
+
+cat("\nTrial counts by complexity:\n")
+print(complexity_summary)
+
+cat("\nTrial count distribution per participant:\n")
+print(trials_per_participant_summary)
+```
+
+```{r}
+# If any non-positive values are present, apply a minimal shift (should not occur in principle)
+eps <- 0
+if(any(df$head_move <= 0, na.rm=TRUE)){
+  eps <- abs(min(df$head_move[df$head_move> -Inf], na.rm=TRUE)) + 1e-6
+}
+df <- df %>% mutate(
+  head_move_shifted = head_move + eps,
+  log_head_move = log(head_move_shifted)
+)
+```
+
+# 2. Distribution & skewness: raw vs log scale
+
+```{r fig.height=4.5, fig.width=7}
+p1 <- ggplot(df, aes(x=head_move)) + geom_histogram(bins=30) + theme_minimal() + ggtitle("Head movement (raw scale)")
+p2 <- ggplot(df, aes(x=log_head_move)) + geom_histogram(bins=30) + theme_minimal() + ggtitle("log(HeadMovement)")
+p1 / p2
+```
+
+```{r}
+sk_raw <- moments::skewness(df$head_move, na.rm=TRUE)
+ku_raw <- moments::kurtosis(df$head_move, na.rm=TRUE) - 3
+sk_log <- moments::skewness(df$log_head_move, na.rm=TRUE)
+ku_log <- moments::kurtosis(df$log_head_move, na.rm=TRUE) - 3
+
+tibble(
+  scale = c("raw","log"),
+  skewness = c(sk_raw, sk_log),
+  kurtosis_excess = c(ku_raw, ku_log)
+) %>% kable(digits=3) %>% kable_styling(full_width=FALSE)
+```
+
+# 3. Diagnostics: LMM on raw scale vs log-LMM
+
+```{r}
+m_raw <- lme4::lmer(head_move ~ group * complexity + (1|participant), data=df, REML=FALSE)
+m_log <- lme4::lmer(log_head_move ~ group * complexity + (1|participant), data=df, REML=FALSE)
+
+diag_df <- bind_rows(
+  broom.mixed::augment(m_raw) %>% mutate(model="Gaussian LMM", std_resid = .resid / sigma(m_raw)),
+  broom.mixed::augment(m_log) %>% mutate(model="log-LMM", std_resid = .resid / sigma(m_log))
+)
+```
+
+```{r fig.height=5.5, fig.width=7}
+ggplot(diag_df, aes(.fitted, std_resid)) +
+  geom_hline(yintercept = 0, linetype="dashed") +
+  geom_point(alpha=.5) +
+  facet_wrap(~model, scales="free_x") +
+  theme_minimal() + labs(x="Fitted", y="Standardised residuals", title="Residuals vs Fitted")
+```
+
+```{r fig.height=5, fig.width=7}
+qq1 <- ggqqplot(diag_df %>% filter(model=="Gaussian LMM") %>% pull(std_resid), title = "QQ（Gaussian LMM Standardised residuals）")
+qq2 <- ggqqplot(diag_df %>% filter(model=="log-LMM") %>% pull(std_resid), title = "QQ（log-LMM Standardised residuals）")
+qq1 / qq2
+```
+
+```{r}
+# Shapiro test (note: overly sensitive in large samples; for reference only)
+sw_raw <- shapiro.test(diag_df %>% filter(model=="Gaussian LMM") %>% pull(std_resid))
+sw_log <- shapiro.test(diag_df %>% filter(model=="log-LMM") %>% pull(std_resid))
+
+tibble(
+  model = c("Gaussian LMM","log-LMM"),
+  W = c(unname(sw_raw$statistic), unname(sw_log$statistic)),
+  p_value = c(sw_raw$p.value, sw_log$p.value)
+) %>% kable(digits=4) %>% kable_styling(full_width=FALSE)
+```
+
+# 4. Heteroscedasticity: Levene tests by cell and variance table
+
+```{r}
+res_df <- diag_df %>% select(.resid, std_resid, group, complexity, model) %>% mutate(cell = interaction(group, complexity, sep=":"))
+lev_raw <- car::leveneTest(std_resid ~ cell, data = res_df %>% filter(model=="Gaussian LMM"), center = median)
+lev_log <- car::leveneTest(std_resid ~ cell, data = res_df %>% filter(model=="log-LMM"), center = median)
+
+lev_raw; lev_log
+```
+
+```{r}
+var_tbl <- res_df %>%
+  group_by(model, cell) %>%
+  summarize(resid_var = var(std_resid, na.rm=TRUE), .groups="drop") %>%
+  pivot_wider(names_from = cell, values_from = resid_var)
+
+kable(var_tbl, digits=4) %>% kable_styling(full_width=FALSE)
+```
+
+# 5. Summary
+
+- On the raw scale, **skewness/kurtosis are pronounced**; standardised residuals show **non-normality and strong heteroscedasticity**.  
+- On the log scale, residuals are **closer to normal** and heteroscedasticity is **substantially reduced**.  
+- Therefore, downstream modelling is better supported by a **log-LMM** or a **Gamma (log-link)** family.
+

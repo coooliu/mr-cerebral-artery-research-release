@@ -1,0 +1,117 @@
+---
+title: "Completion Time : Exploratory Data Analysis"
+author: "CongLiu"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5,
+  fig.align = "center",
+  dpi = 300
+)
+
+suppressPackageStartupMessages({
+library(tidyverse)
+library(ggdist)      # raincloud support
+library(patchwork)
+library(rstatix)
+})
+```
+
+## 1. Data import and preprocessing
+```{r data}
+# ---- Data location ----
+# The raw dataset is stored outside this analysis folder (e.g., in a sibling directory).
+# If your folder layout differs, update `candidate_dirs` below.
+data_file <- "Experimental_Raw_Data.csv"
+candidate_dirs <- c(
+  file.path("..", "data"),
+  file.path("..", "datasets"),
+  ".."
+)
+candidate_paths <- file.path(candidate_dirs, data_file)
+data_path <- candidate_paths[file.exists(candidate_paths)][1]
+
+if (is.na(data_path)) {
+  stop("Data file not found. Checked:
+  - ", paste(candidate_paths, collapse = "
+  - "))
+}
+
+dat <- readr::read_csv(data_path, show_col_types = FALSE) %>% 
+  mutate(
+    group       = factor(group, levels = c("3D-only","2D+3D")),
+    complexity  = factor(complexity, levels = c("simple","complex")),
+    participant = factor(participant),
+    log_ct      = log(completion_time)
+  )
+glimpse(dat)
+```
+
+## 2. Descriptive statistics and normality checks
+```{r desc}
+dat %>% 
+  summarise(
+    mean_sec = mean(completion_time),
+    sd_sec   = sd(completion_time),
+    shapiro_W = shapiro_test(completion_time)$statistic,
+    shapiro_p = shapiro_test(completion_time)$p.value
+  )
+
+dat %>% 
+  summarise(
+    mean_log = mean(log_ct),
+    sd_log   = sd(log_ct),
+    shapiro_W = shapiro_test(log_ct)$statistic,
+    shapiro_p = shapiro_test(log_ct)$p.value
+  )
+```
+
+## 3. Distributional assessment: raw vs. log-transformed
+```{r histo}
+p1 <- ggplot(dat, aes(completion_time)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Raw seconds")
+
+p2 <- ggplot(dat, aes(log_ct)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Log-transformed")
+
+p1 + p2
+```
+
+## 4. Raincloud plots (raw and log scales)
+```{r raincloud}
+p_raw <- ggplot(dat, aes(x = interaction(group, complexity, sep = '\n'), 
+                         y = completion_time)) +
+  stat_halfeye(adjust = .5, width = .6, .width = 0, point_colour = NA) +
+  geom_boxplot(width = .15, outlier.shape = NA, alpha = .4) +
+  geom_jitter(width = .05, height = 0, size = 1.2, alpha = .5) +
+  labs(x = NULL, y = "Completion time (s)") +
+  theme_minimal()
+
+p_log <- ggplot(dat, aes(x = interaction(group, complexity, sep = '\n'), 
+                         y = log_ct)) +
+  stat_halfeye(adjust = .5, width = .6, .width = 0, point_colour = NA) +
+  geom_boxplot(width = .15, outlier.shape = NA, alpha = .4) +
+  geom_jitter(width = .05, height = 0, size = 1.2, alpha = .5) +
+  labs(x = NULL, y = "Log completion time") +
+  theme_minimal()
+
+p_raw / p_log
+```
+
+---
+**Note.** We first assess right-skewness and normality on the raw scale, then illustrate how the log transform improves symmetry to motivate the subsequent LMM analyses.

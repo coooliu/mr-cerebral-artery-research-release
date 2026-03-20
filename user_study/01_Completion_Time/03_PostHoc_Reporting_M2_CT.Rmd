@@ -1,0 +1,787 @@
+---
+title: "Completion Time : Post-hoc & Reporting (Model M2)"
+author: "CongLiu"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    word_document: default
+    pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5,
+  fig.align = "center",
+  dpi = 300
+)
+
+suppressPackageStartupMessages({
+library(tidyverse)
+library(nlme)
+library(emmeans)
+library(car)
+library(performance)
+if (!requireNamespace("parameters", quietly=TRUE)) install.packages("parameters", repos="https://cloud.r-project.org")
+library(parameters)
+})
+```
+
+
+## 1. Data and final model (M2)
+```{r data}
+# ---- Data location ----
+# The raw dataset is stored outside this analysis folder (e.g., in a sibling directory).
+# If your folder layout differs, update `candidate_dirs` below.
+data_file <- "Experimental_Raw_Data.csv"
+candidate_dirs <- c(
+  file.path("..", "data"),
+  file.path("..", "datasets"),
+  ".."
+)
+candidate_paths <- file.path(candidate_dirs, data_file)
+data_path <- candidate_paths[file.exists(candidate_paths)][1]
+
+if (is.na(data_path)) {
+  stop("Data file not found. Checked:
+  - ", paste(candidate_paths, collapse = "
+  - "))
+}
+
+dat <- readr::read_csv(data_path, show_col_types = FALSE) %>% 
+  mutate(
+    group       = factor(group, levels = c("3D-only","2D+3D")),
+    complexity  = factor(complexity, levels = c("simple","complex")),
+    participant = factor(participant),
+    log_ct      = log(completion_time)
+  )
+
+m_final <- lme(log_ct ~ group * complexity,
+               random  = ~1 | participant,
+               weights = varIdent(form = ~1 | complexity),
+               data = dat,
+               method = "REML")
+```
+
+## Tab 2 — Fixed-effects summary（Main）
+
+```{r tab2_fixef, results='asis', message=FALSE, warning=FALSE}
+fe_table <- function(fit, reference="3D-only × simple", digits=3){
+  if (!requireNamespace("parameters", quietly = TRUE)) install.packages("parameters", repos="https://cloud.r-project.org")
+  suppressPackageStartupMessages({ library(parameters); library(dplyr) })
+  tab <- parameters::model_parameters(fit, ci_method = "wald", verbose = FALSE)
+  stat_col <- if("t" %in% names(tab)) "t" else if("z" %in% names(tab)) "z" else if("Statistic" %in% names(tab)) "Statistic" else names(tab)[1]
+  out <- tab %>% dplyr::transmute(
+    Term = Parameter, `β` = Coefficient, SE = SE,
+    Stat = .data[[stat_col]], p = p,
+    `95% CI` = sprintf("[%.3f, %.3f]", CI_low, CI_high)
+  )
+  kb <- knitr::kable(out, digits = digits,
+    caption = paste0("Fixed-effects summary (Model M2) — reference: ", reference))  
+  if (requireNamespace("kableExtra", quietly = TRUE)) {
+    kb <- kb %>% kableExtra::kable_styling(full_width = FALSE)
+  }
+  kb
+}
+fe_table(m_final)
+```
+
+
+
+## Forest data — standardized effects (Std. β)
+
+```{r forest_std_ct, results='asis', message=FALSE, warning=FALSE}
+# Required packages
+pkgs <- c("parameters","effectsize","insight","dplyr","knitr")
+for(p in pkgs) if(!requireNamespace(p, quietly=TRUE)) install.packages(p, repos="https://cloud.r-project.org")
+suppressPackageStartupMessages({ library(parameters); library(effectsize); library(insight); library(dplyr); library(knitr) })
+
+std_table <- function(fit, terms = c("group2D+3D","complexitycomplex","group2D+3D:complexitycomplex"), component=NULL){
+  # Try refit-based standardization first
+  tab <- NULL
+  try({
+    if(inherits(fit,"glmmTMB")){
+      tab <- effectsize::standardize_parameters(fit, method="refit",
+                                                component=if(is.null(component)) "conditional" else component, ci=0.95)
+    } else {
+      tab <- effectsize::standardize_parameters(fit, method="refit", ci=0.95)
+    }
+  }, silent = TRUE)
+
+  recode_label <- c("group2D+3D"="Group (2D+3D vs 3D-only)",
+                    "complexitycomplex"="Complexity (complex vs simple)",
+                    "group2D+3D:complexitycomplex"="Interaction")
+
+  use_refit <- !is.null(tab)
+  if(use_refit){
+    df <- as.data.frame(tab)
+    # Keep only requested terms; if Std_Coefficient is all NA, fall back
+    if(all(is.na(df$Std_Coefficient[df$Parameter %in% terms]))){
+      use_refit <- FALSE
+    } else {
+      out <- df[df$Parameter %in% terms, , drop=FALSE]
+      out <- out %>%
+        dplyr::transmute(Effect = dplyr::recode(Parameter, !!!recode_label),
+                         `Std. β` = Std_Coefficient,
+                         `CI low`  = CI_low_Std,
+                         `CI high` = CI_high_Std)
+      return(out)
+    }
+  }
+
+  # Fallback path: Wald CI on model scale -> standardize via beta * SD(col in model matrix) / SD(Y)
+  raw <- parameters::model_parameters(fit,
+          component = if(inherits(fit,"glmmTMB")) "conditional" else NULL,
+          ci_method = "wald")
+  raw <- as.data.frame(raw)
+  raw <- raw[raw$Parameter %in% terms, , drop=FALSE]
+
+  # SD(Y) from data
+  mf <- insight::get_data(fit, verbose=FALSE)
+  resp <- insight::find_response(fit)
+  SDy <- stats::sd(mf[[resp]], na.rm=TRUE)
+
+  # Use *model matrix* so column names match coefficient labels
+  mm <- try(insight::get_modelmatrix(fit, component = "conditional"), silent = TRUE)
+  if(inherits(mm, "try-error") || is.null(mm)){
+    mm <- try(stats::model.matrix(stats::formula(fit), data = mf), silent = TRUE)
+  }
+
+  get_sdx <- function(param){
+    if(!is.null(mm) && !inherits(mm, "try-error") && param %in% colnames(mm)){
+      return(stats::sd(mm[, param], na.rm=TRUE))
+    }
+    # Last resort: approximate using predictor variance if column can't be found
+    varname <- sub(":.*", "", sub("(.*?)(\\w+)$", "\\1\\2", param))
+    if(!is.null(mf[[varname]])){
+      x <- mf[[varname]]
+      ux <- stats::na.omit(unique(x))
+      if(length(ux)==2 && all(sort(ux) %in% c(0,1))) {
+        p <- mean(x, na.rm=TRUE); return(sqrt(p*(1-p)))
+      }
+      return(stats::sd(x, na.rm=TRUE))
+    }
+    return(NA_real_)
+  }
+
+  sdx <- vapply(raw$Parameter, get_sdx, numeric(1))
+  out <- raw %>%
+    dplyr::transmute(Effect = dplyr::recode(Parameter, !!!recode_label),
+                     `Std. β` = Coefficient * sdx / SDy,
+                     `CI low` = CI_low     * sdx / SDy,
+                     `CI high`= CI_high    * sdx / SDy)
+  return(out)
+}
+
+# --- Choose the model object for this document ---
+forest_df <- std_table(m_final, component=NULL)
+
+knitr::kable(forest_df, digits=3,
+             caption = "Forest data — standardized effects (Std. β with 95% CI; baseline = 3D-only × simple)")
+```
+
+## 2. Type III significance tests
+```{r type3}
+Anova(m_final, type = "III")   # from car package
+```
+
+## 3. Simple effects (EMMs with Holm adjustment)
+```{r emm}
+emm <- emmeans(m_final, ~ group | complexity)
+pair_res <- pairs(emm, adjust = "holm")
+pair_res
+```
+
+## 4. Back-transformation to seconds and effect sizes
+```{r backtransform}
+emm_resp <- summary(emm, infer = TRUE) %>% 
+  as.data.frame() %>% 
+  mutate(
+    time_sec  = exp(emmean),
+    lower_sec = exp(lower.CL),
+    upper_sec = exp(upper.CL)
+  )
+emm_resp
+
+# Cohen's d (log scale) #
+# Extract contrast estimates
+contrast_df <- as.data.frame(summary(pair_res))
+# Use the overall residual SD
+sigma_val <- as.numeric(summary(m_final)$sigma)
+contrast_df <- contrast_df %>% 
+  mutate(
+    cohen_d = estimate / sigma_val
+  )
+contrast_df
+```
+
+## 5. Interaction visualization (seconds)
+```{r raincloud-plot, fig.height=7, fig.width=7}
+dat_ct_raw <- dat %>%
+  dplyr::select(participant, group, complexity, completion_time) %>%
+  dplyr::rename(time_sec = completion_time)
+
+# ---------- Colours ----------
+col_blue <- "#3E69B0"  # 3D-only
+col_red  <- "#C61B21"  # 2D+3D
+
+# ---------- Data range ----------
+y_raw_min <- min(dat_ct_raw$time_sec, emm_resp$lower_sec, na.rm = TRUE)
+y_raw_max <- max(dat_ct_raw$time_sec, emm_resp$upper_sec, na.rm = TRUE)
+
+# Y-axis ticks（remove zero）
+y_breaks_all  <- pretty(c(y_raw_min, y_raw_max), n = 5)
+y_breaks_used <- y_breaks_all[y_breaks_all != 0]
+
+y_axis_min <- min(y_breaks_used)
+y_axis_max <- max(y_breaks_used)
+dy         <- y_axis_max - y_axis_min
+
+# Plot limits
+y_plot_min <- y_axis_min - 0.30 * dy
+y_plot_max <- y_axis_max + 0.05 * dy
+
+# ---------- X-axis numeric positions ----------
+x_simple  <- 1
+x_complex <- 2
+x_rng     <- x_complex - x_simple
+
+x_plot_min <- x_simple - 0.7
+x_plot_max <- x_complex + 0.5
+
+# ---------- Custom y-axis tick marks (left-facing) ----------
+y_axis_x  <- x_simple - 0.35        # vertical line x
+y_tick_x1 <- y_axis_x               # horizontal tickstart (on the axis line)
+y_tick_x2 <- y_axis_x - 0.05        # horizontal tickend (to the left)
+
+# ---------- Custom x-axis tick marks (downward) ----------
+x_axis_y  <- y_axis_min - 0.08 * dy       # horizontal tick y
+x_tick_y1 <- x_axis_y                     # vertical linestart
+x_tick_y2 <- x_axis_y - 0.04 * dy         # vertical lineend (downward)
+
+# =====================================================================
+# Main panel
+# =====================================================================
+p_ct_raincloud <- ggplot() +
+
+  # ===== simple side: left half-eye + points + boxplot =====
+  gghalves::geom_half_violin(
+    data = dat_ct_raw %>% filter(complexity == "simple", group == "3D-only"),
+    aes(x = as.numeric(complexity), y = time_sec,
+        fill = group, colour = group),
+    side = "l", width = 0.4, trim = FALSE,
+    alpha = 0.35, linewidth = 0.9
+  ) +
+  gghalves::geom_half_violin(
+    data = dat_ct_raw %>% filter(complexity == "simple", group == "2D+3D"),
+    aes(x = as.numeric(complexity), y = time_sec,
+        fill = group, colour = group),
+    side = "l", width = 0.4, trim = FALSE,
+    alpha = 0.35, linewidth = 0.9
+  ) +
+  geom_point(
+    data = dat_ct_raw %>% filter(complexity == "simple"),
+    aes(x = as.numeric(complexity) + 0.10, y = time_sec, colour = group),
+    position = position_jitter(width = 0.05, height = 0, seed = 2025),
+    alpha = 0.6, shape = 16, size = 2.2
+  ) +
+  geom_boxplot(
+    data = dat_ct_raw %>% filter(complexity == "simple", group == "3D-only"),
+    aes(x = as.numeric(complexity) + 0.25, y = time_sec,
+        fill = group, colour = group),
+    width = 0.08,
+    alpha = 0.25, outlier.shape = NA, linewidth = 0.9
+  ) +
+  geom_boxplot(
+    data = dat_ct_raw %>% filter(complexity == "simple", group == "2D+3D"),
+    aes(x = as.numeric(complexity) + 0.35, y = time_sec,
+        fill = group, colour = group),
+    width = 0.08,
+    alpha = 0.25, outlier.shape = NA, linewidth = 0.9
+  ) +
+
+  # ===== complex side: right half-eye + points + boxplot =====
+  gghalves::geom_half_violin(
+    data = dat_ct_raw %>% filter(complexity == "complex", group == "3D-only"),
+    aes(x = as.numeric(complexity), y = time_sec,
+        fill = group, colour = group),
+    side = "r", width = 0.4, trim = FALSE,
+    alpha = 0.35, linewidth = 0.9
+  ) +
+  gghalves::geom_half_violin(
+    data = dat_ct_raw %>% filter(complexity == "complex", group == "2D+3D"),
+    aes(x = as.numeric(complexity), y = time_sec,
+        fill = group, colour = group),
+    side = "r", width = 0.4, trim = FALSE,
+    alpha = 0.35, linewidth = 0.9
+  ) +
+  geom_point(
+    data = dat_ct_raw %>% filter(complexity == "complex"),
+    aes(x = as.numeric(complexity) - 0.10, y = time_sec, colour = group),
+    position = position_jitter(width = 0.05, height = 0, seed = 2025),
+    alpha = 0.6, shape = 16, size = 2.2
+  ) +
+  geom_boxplot(
+    data = dat_ct_raw %>% filter(complexity == "complex", group == "3D-only"),
+    aes(x = as.numeric(complexity) - 0.35, y = time_sec,
+        fill = group, colour = group),
+    width = 0.08,
+    alpha = 0.25, outlier.shape = NA, linewidth = 0.9
+  ) +
+  geom_boxplot(
+    data = dat_ct_raw %>% filter(complexity == "complex", group == "2D+3D"),
+    aes(x = as.numeric(complexity) - 0.25, y = time_sec,
+        fill = group, colour = group),
+    width = 0.08,
+    alpha = 0.25, outlier.shape = NA, linewidth = 0.9
+  ) +
+
+  # ===== EMM (dynamic offsets: as.numeric(complexity) + offset) =====
+geom_line(
+  data = emm_resp,
+  aes(
+    x = as.numeric(complexity) + case_when(
+      # Return an offset consistent with the boxplot for each group × complexity combination
+      group == "3D-only" & complexity == "simple" ~ 0.25,  # boxplot offset+0.25
+      group == "2D+3D" & complexity == "simple" ~ 0.35,  # boxplot offset+0.35
+      group == "3D-only" & complexity == "complex" ~ -0.35, # boxplot offset-0.35
+      group == "2D+3D" & complexity == "complex" ~ -0.25  # boxplot offset-0.25
+    ),
+    y = time_sec,
+    group = group,
+    colour = group
+  ),
+  linewidth = 1.1
+) +
+geom_errorbar(
+  data = emm_resp,
+  aes(
+    x = as.numeric(complexity) + case_when(
+      group == "3D-only" & complexity == "simple" ~ 0.25,
+      group == "2D+3D" & complexity == "simple" ~ 0.35,
+      group == "3D-only" & complexity == "complex" ~ -0.35,
+      group == "2D+3D" & complexity == "complex" ~ -0.25
+    ),
+    ymin = lower_sec, ymax = upper_sec,
+    group = group, colour = group
+  ),
+  width = 0, linewidth = 1.1
+) +
+geom_point(
+  data = emm_resp,
+  aes(
+    x = as.numeric(complexity) + case_when(
+      group == "3D-only" & complexity == "simple" ~ 0.25,
+      group == "2D+3D" & complexity == "simple" ~ 0.35,
+      group == "3D-only" & complexity == "complex" ~ -0.35,
+      group == "2D+3D" & complexity == "complex" ~ -0.25
+    ),
+    y = time_sec,
+    group = group,
+    fill = group,
+    colour = group
+  ),
+  shape = 23, size = 3.0, stroke = 1.0
+) +
+ # ===== min–max of all raw data vertical line + upper/lower horizontal ticks =====
+  stat_summary(
+    data = dat_ct_raw,
+    aes(
+      x = as.numeric(complexity) + dplyr::case_when(
+        group == "3D-only" & complexity == "simple"  ~  0.25,
+        group == "2D+3D"  & complexity == "simple"  ~  0.35,
+        group == "3D-only" & complexity == "complex" ~ -0.35,
+        group == "2D+3D"  & complexity == "complex" ~ -0.25
+      ),
+      y     = time_sec,
+      colour = group,
+      group  = interaction(group, complexity)  # one line per group × complexity
+    ),
+    fun.min = min,      # y-axis lower end: minimum of all raw data
+    fun.max = max,      # y-axis upper end: maximum of all raw data
+    geom    = "errorbar",
+    width   = 0.07,     # >0 draws upper/lower end-caps; adjust to taste
+    linewidth = 0.9
+  )+
+  # =================================================================
+  # Custom axes: draw the axis line first
+  # =================================================================
+  # Y-axis vertical line + left-facing tick marks
+  geom_segment(
+    inherit.aes = FALSE,
+    aes(x = y_axis_x, xend = y_axis_x,
+        y = y_axis_min, yend = y_axis_max),
+    linewidth = 0.7
+  ) +
+  geom_segment(
+    inherit.aes = FALSE,
+    data = data.frame(y = y_breaks_used),
+    aes(x = y_tick_x1, xend = y_tick_x2,
+        y = y, yend = y),
+    linewidth = 0.7
+  ) +
+
+  # X-axis horizontal line + downward tick marks per category
+  geom_segment(
+    inherit.aes = FALSE,
+    aes(x = x_simple, xend = x_complex,
+        y = x_axis_y, yend = x_axis_y),
+    linewidth = 0.7
+  ) +
+  geom_segment(
+    inherit.aes = FALSE,
+    data = data.frame(x = c(x_simple, x_complex)),
+    aes(x = x, xend = x,
+        y = x_tick_y1, yend = x_tick_y2),
+    linewidth = 0.7
+  ) +
+
+  # =================================================================
+  # Manually draw tick labels and axis titles near the custom axes
+  # =================================================================
+
+  # Y-axis tick values (slightly to the right of the axis)
+  geom_text(
+    inherit.aes = FALSE,
+    data = data.frame(
+      y     = y_breaks_used,
+      label = y_breaks_used
+    ),
+    aes(x = y_axis_x - 0.15, y = y, label = label),
+    hjust = 0, vjust = 0.5, size = 3.5
+  ) +
+
+  # X-axis tick values (slightly below the downward ticks)
+  geom_text(
+    inherit.aes = FALSE,
+    data = data.frame(
+      x     = c(x_simple, x_complex),
+      label = c("Simple", "Complex")
+    ),
+    aes(x = x, y = x_tick_y2 - 0.03 * dy, label = label),
+    vjust = 1, size = 3.5
+  ) +
+
+  # Y-axis title (centered along the axis, rotated 90°)
+  geom_text(
+    inherit.aes = FALSE,
+    aes(x = y_axis_x - 0.3,
+        y = (y_axis_min + y_axis_max) / 2,
+        label = "Completion time (s)"),
+    angle = 90, hjust = 0.5, vjust = 0.5, size = 4
+  ) +
+
+  # X-axis title (below the mid-point and tick values)
+  geom_text(
+    inherit.aes = FALSE,
+    aes(x = (x_simple + x_complex) / 2,
+        y = x_tick_y2 - 0.10 * dy,
+        label = "Complexity"),
+    vjust = 1, size = 4
+  ) +
+
+  # ===== Colours & Legend =====
+  scale_colour_manual(
+    values = c("3D-only" = col_blue,
+               "2D+3D"   = col_red),
+    name   = "Condition"
+  ) +
+  scale_fill_manual(
+    values = c("3D-only" = alpha(col_blue, 0.35),
+               "2D+3D"   = alpha(col_red,  0.35)),
+    name   = "Condition"
+  ) +
+
+  # ===== Coordinate scaling (continuous x with custom breaks) =====
+  scale_y_continuous(
+    limits = c(y_plot_min, y_plot_max),
+    breaks = y_breaks_used
+  ) +
+  scale_x_continuous(
+    limits = c(x_plot_min, x_plot_max),
+    breaks = c(x_simple, x_complex),
+    labels = NULL   # omit default labels (drawn manually)
+  ) +
+
+  # ===== Theme =====
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_blank(),   # remove grey gridlines
+    panel.grid.minor   = element_blank(),
+    axis.text.x        = element_blank(),   # remove default tick labels
+    axis.text.y        = element_blank(),
+    axis.title.x       = element_blank(),   # remove default axis title
+    axis.title.y       = element_blank(),
+    axis.ticks         = element_blank(),
+    axis.line          = element_blank(),
+    legend.position    = "top",
+    legend.title       = element_text(size = 11),
+    legend.margin      = margin(b = -5),
+    plot.margin        = margin(10, 25, 35, 45)
+  ) +
+  coord_cartesian(clip = "off")
+
+p_ct_raincloud
+```
+
+---
+**Note.** This file uses the selected Model M2 (heteroscedastic LME) to compute Type III tests and post-hoc comparisons; the y-axis has been back-transformed to seconds for interpretability.
+
+## 7. Completion Time — Δ EMMs Forest (integrated table + plot, aligned version)
+
+> This section **does not modify the original code**; it adds an **aligned** version that combines a left-hand table with a right-hand forest plot.  
+> Each row in the left table is **exactly aligned** with the corresponding row in the forest plot; “Condition Effect (2D+3D vs. 3D-only) / Complexity Effect (Complex vs. Simple)” is shown as a **multi-row group label** on the left.  
+> The forest panel omits repeating contrast names to avoid duplication with the left table.
+
+```{r forest_ct_emm_aligned, fig.height=5, fig.width=10, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(emmeans); library(dplyr); library(tidyr); library(forcats)
+  library(ggplot2); library(scales); library(glue)
+})
+
+# === 1) Obtain cell EMMs (link scale: log-seconds) ===
+emm_cells <- emmeans(m_final, ~ group*complexity)
+
+# 2) Back-transform to the response scale (seconds): geometric mean = exp(EMM)
+emm_link  <- summary(emm_cells, infer = TRUE)
+
+# 3) Construct the cell table used for A|B; `time_sec` must be on the response scale (seconds)
+cells_df <- as.data.frame(emm_link) |>
+  dplyr::transmute(
+    group, complexity,
+    time_sec = exp(emmean)
+  )
+
+# === 2) Four contrasts (response scale; Holm + CI)===
+grp_res <- contrast(emm_cells, method = "revpairwise", by = "complexity", adjust = "holm") %>%
+  summary(infer = TRUE) %>% as.data.frame() %>%
+  dplyr::mutate(
+    Contrast = dplyr::case_when(
+      complexity == "simple"  ~ "Simple Scenario",
+      complexity == "complex" ~ "Complex Scenario",
+      TRUE ~ paste0("Group@", complexity)
+    ),
+    Block = "Condition Effect (2D+3D vs. 3D-only) "
+  )
+
+cpx_res <- contrast(emm_cells, method = "revpairwise", by = "group", adjust = "holm") %>%
+  summary(infer = TRUE) %>% as.data.frame() %>%
+  dplyr::mutate(
+    Contrast = dplyr::case_when(
+      group == "3D-only" ~ "3D-only Condition",
+      group == "2D+3D"   ~ "2D+3D Condition",
+      TRUE ~ paste0("Complexity@", group)
+    ),
+    Block = "Complexity Effect (Complex vs. Simple)"
+  )
+
+ct_contr <- dplyr::bind_rows(grp_res, cpx_res) %>%
+  dplyr::transmute(
+    Contrast, Block,
+    ln_ratio = estimate, ln_low = lower.CL, ln_high = upper.CL,
+    gmr = exp(estimate), gmr_low = exp(lower.CL), gmr_high = exp(upper.CL),
+    p_holm = p.value, group, complexity
+  )
+
+# === 3) Fixed ordering + spacing settings (tunable)===
+row_order <- c("Simple Scenario", "Complex Scenario", "3D-only Condition", "2D+3D Condition")
+
+gap_within_block1 <- 0.20
+gap_between_blocks <- 0.60
+gap_within_block2 <- 0.20
+
+y1 <- 0.3
+y2 <- y1 - gap_within_block1
+y3 <- y2 - gap_between_blocks
+y4 <- y3 - gap_within_block2
+
+row_y <- c("Simple Scenario"=y1,"Complex Scenario"=y2,"3D-only Condition"=y3,"2D+3D Condition"=y4)
+row_map <- tibble::tibble(Contrast = factor(names(row_y), levels = row_order),
+                          y = as.numeric(row_y[as.character(Contrast)]))
+
+ct_contr <- ct_contr %>%
+  dplyr::mutate(Contrast = factor(Contrast, levels = row_order)) %>%
+  dplyr::left_join(row_map, by = "Contrast") %>%
+  dplyr::arrange(dplyr::desc(y)) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    baseline = dplyr::case_when(
+      Contrast == "Simple Scenario"        ~ cells_df$time_sec[cells_df$group=="3D-only" & cells_df$complexity=="simple"],
+      Contrast == "Complex Scenario"       ~ cells_df$time_sec[cells_df$group=="3D-only" & cells_df$complexity=="complex"],
+      Contrast == "3D-only Condition"  ~ cells_df$time_sec[cells_df$group=="3D-only" & cells_df$complexity=="simple"],
+      Contrast == "2D+3D Condition"    ~ cells_df$time_sec[cells_df$group=="2D+3D"   & cells_df$complexity=="simple"],
+      TRUE ~ NA_real_
+    ),
+    a_time = dplyr::case_when(
+      Contrast == "Simple Scenario"        ~ cells_df$time_sec[cells_df$group=="2D+3D" & cells_df$complexity=="simple"],
+      Contrast == "Complex Scenario"       ~ cells_df$time_sec[cells_df$group=="2D+3D" & cells_df$complexity=="complex"],
+      Contrast == "3D-only Condition"  ~ cells_df$time_sec[cells_df$group=="3D-only" & cells_df$complexity=="complex"],
+      Contrast == "2D+3D Condition"    ~ cells_df$time_sec[cells_df$group=="2D+3D"   & cells_df$complexity=="complex"],
+      TRUE ~ NA_real_
+    ),
+    pct_change = 100 * (gmr - 1)
+  ) %>% dplyr::ungroup()
+
+y_top    <- max(row_map$y)
+y_bottom <- min(row_map$y)
+
+# === 4) Left-table column positions ===
+col_x <- c(
+  "Contrast" = 0.15,
+  "EMMs A|B (s)" = 1.45,
+  "GMR[95% CI]" = 2.25,
+  "p (Holm)" = 3.35
+)
+xlim_tbl <- c(0.05, 3.6)
+
+# forest horizontal position and width within the canvas
+forest_gap_x <- 0.40
+forest_width <- 2.20
+x_forest_min <- xlim_tbl[2] + forest_gap_x
+x_forest_max <- x_forest_min + forest_width
+
+# === 5) Forest numeric range + nice tick marks (prefer 0.5 / 0.25 / 1)===
+xr_raw <- range(c(ct_contr$gmr_low, ct_contr$gmr_high), na.rm = TRUE)
+pad    <- max(diff(xr_raw) * 0.06, 0.03)
+xlim_for <- c(xr_raw[1] - pad, xr_raw[2] + pad)
+
+choose_step <- function(rng, target_ticks = 4) {
+  width <- diff(rng)
+  cand  <- c(0.1, 0.2, 0.25, 0.5, 1, 2)
+  cand[which.min(abs(width/cand - target_ticks))]
+}
+step <- choose_step(xlim_for, target_ticks = 4)
+
+low  <- floor(xlim_for[1]/step) * step
+high <- ceiling(xlim_for[2]/step) * step
+x_breaks_for <- seq(low, high, by = step)
+# Ensure that 0 is included in the range
+if (xlim_for[1] <= 1 && xlim_for[2] >= 1) x_breaks_for <- sort(unique(c(x_breaks_for, 1)))
+x_breaks_for <- x_breaks_for[x_breaks_for >= xlim_for[1] & x_breaks_for <= xlim_for[2]]
+
+# value -> forest x coordinate in the shared canvas
+xf <- function(x) scales::rescale(x, to = c(x_forest_min, x_forest_max), from = xlim_for)
+
+ct_contr <- ct_contr %>%
+  dplyr::mutate(x_low = xf(gmr_low), x_high = xf(gmr_high), x_mid = xf(gmr))
+
+x_ticks <- data.frame(
+  brk = x_breaks_for,
+  x   = xf(x_breaks_for)
+)
+tick_lab <- scales::label_number(accuracy = step)(x_ticks$brk)
+
+# === 6) header / thick horizontal rule / group titles(each can be fine-tuned independently)===
+header_text_y   <- y_top + 0.65     # header text 'top edge' height
+header_line_gap <- 0.08             # gap between header and thick rule（larger values move the rule downward）
+header_line_y   <- header_text_y - header_line_gap
+
+header_df <- data.frame(
+  x     = unname(col_x),
+  y     = header_text_y,
+  label = names(col_x)
+)
+
+sec_offset_top    <- 0.20   # Condition Effect (2D+3D vs. 3D-only) vs Simple Scenario
+sec_offset_bottom <- 0.20   # Complexity Effect (Complex vs. Simple) vs 3D-only Condition
+sec_labels <- dplyr::tibble(
+  label = c("Condition Effect (2D+3D vs. 3D-only)", "Complexity Effect (Complex vs. Simple)"),
+  y     = c(row_y["Simple Scenario"] + sec_offset_top,
+            row_y["3D-only Condition"] + sec_offset_bottom),
+  x     = unname(col_x["Contrast"])
+)
+# === 6.9) shift all rows below the thick rule upward(without changing the thick rule position) ===
+body_dy <- 0.15   # tunable: positive=up, negative=down (e.g., 0.10–0.25)
+ct_contr  <- ct_contr  %>% dplyr::mutate(y = y + body_dy)   # rows (left/right aligned)
+sec_labels <- sec_labels %>% dplyr::mutate(y = y + body_dy) # group labels shifted as well
+
+# === 7) draw the bottom axis manually (solid line + ticks + labels)，and stop the zero dashed line at the axis===
+axis_gap       <- 0.15           # distance from the bottom row
+axis_y         <- y_bottom - axis_gap
+tick_up        <- 0.08
+tick_down      <- 0.06
+tick_label_gap <- 0.28
+tick_label_y   <- axis_y - tick_label_gap
+
+# y-range must include axis line / ticks / labels
+ylims_lower <- axis_y - (tick_label_gap + tick_down + 0.18)
+ylims_upper <- y_top + 1.90
+ylims       <- c(ylims_lower, ylims_upper)
+y_breaks    <- row_map$y
+
+# vertical zero dashed line: from axis to thick rule
+draw_one <- (xlim_for[1] <= 1 && xlim_for[2] >= 1)
+vline_df  <- if (draw_one) data.frame(x = xf(1)) else data.frame(x = numeric(0))
+
+# === 8) Single-canvas rendering ===
+tbl_show <- ct_contr %>%
+  dplyr::transmute(
+    Contrast, y,
+    `EMMs A|B (s)` = sprintf("%s | %s", format(round(a_time, 2), nsmall = 2), format(round(baseline, 2), nsmall = 2)),
+    `GMR[95% CI]` = sprintf("%.3f [%.3f, %.3f]", gmr, gmr_low, gmr_high),
+    `p (Holm)` = ifelse(p_holm < .001, "< .001", format(round(p_holm, 3), nsmall = 3))
+  )
+tbl_long <- tbl_show %>%
+  tidyr::pivot_longer(cols = c("Contrast","EMMs A|B (s)","GMR[95% CI]","p (Holm)"),
+                      names_to = "col", values_to = "val") %>%
+  dplyr::mutate(x = unname(col_x[col]), is_bold = (col == "Contrast"))
+
+ggplot() +
+  # Left: group headers + table body + table header
+  geom_text(data = sec_labels, aes(x = x, y = y, label = label),
+            hjust = 0, vjust = 0, fontface = "bold", size = 4) +
+  geom_text(data = tbl_long,
+            aes(x = x, y = y, label = val, fontface = ifelse(is_bold,"bold","plain"), colour = "black"),
+            hjust = 0, vjust = 0.5, size = 3.6, lineheight = 1.0) +
+  geom_text(data = header_df, aes(x = x, y = y, label = label),
+            hjust = 0, vjust = 0, size = 3.7, fontface = "bold") +
+  scale_colour_identity() +
+
+  # Thick rule spanning both panels
+  geom_segment(aes(x = -Inf, xend = Inf, y = header_line_y, yend = header_line_y),
+               linewidth = 1.0) +
+
+  # Right: forest CIs + point estimates
+  geom_segment(data = ct_contr, aes(x = x_low, xend = x_high, y = y, yend = y), linewidth = 0.9) +
+  geom_point(data = ct_contr, aes(x = x_mid, y = y), size = 2.8) +
+
+  # Zero reference (dashed; from axis to thick rule)
+  geom_segment(data = vline_df,
+               aes(x = x, xend = x), y = axis_y, yend = header_line_y,
+               linetype = "dashed", linewidth = 0.6) +
+
+  # Forest title at the top (aligned with the table header y)
+  annotate("text", x = x_forest_min, y = header_text_y, label = "GMR[95% CI]",
+           hjust = -1.4, vjust = 0, size = 3.7, fontface = "bold") +
+
+  # —— draw the bottom axis manually (ticks first, then axis line; redraw to ensure visibility)——
+  geom_segment(data = x_ticks,
+               aes(x = x, xend = x, y = axis_y - tick_down, yend = axis_y + tick_up),
+               linewidth = 0.6, lineend = "butt") +
+  geom_text(data = x_ticks, aes(x = x, y = tick_label_y, label = tick_lab),
+            vjust = 1, size = 3.2) +
+  annotate("segment", x = x_forest_min, xend = x_forest_max,
+           y = axis_y, yend = axis_y, linewidth = 1.0, lineend = "square") +
+
+  # Coordinates and theme
+  coord_cartesian(xlim = c(xlim_tbl[1], x_forest_max + 0.05), ylim = ylims, clip = "on") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.title  = element_blank(),
+    axis.text   = element_blank(),
+    panel.grid  = element_blank(),
+    plot.margin = margin(t = 6, r = 6, b = 6, l = 4)
+  )
+
+
+```
+
+> Figure note (aligned version): the **left table** and **right forest** are aligned row-by-row; “Condition Effect (2D+3D vs. 3D-only) / Complexity Effect (Complex vs. Simple)” is displayed as the left-side group label.  
+> The forest plot reports Δ (seconds) with 95% CIs on the response scale; the dashed line indicates zero difference; p-values are Holm-adjusted.

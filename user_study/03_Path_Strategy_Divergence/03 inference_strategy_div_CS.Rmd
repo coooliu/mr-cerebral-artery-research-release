@@ -1,0 +1,1216 @@
+
+---
+title: "Inference and Post-hoc Analyses (Outcome: strategy_div; ZIB one-step + two-step synthesis)"
+author: "CongLiu"
+params:
+  data_path: "Experimental_Raw_Data.csv"
+  B: 3000   # Number of parameter draws for Monte Carlo uncertainty (two-step synthesis)
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  comment = NA,
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  results = "asis",
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.8,
+  dpi = 300,
+  fig.retina = 2
+)
+set.seed(2025)
+
+options(width = 120)
+options(knitr.kable.NA = "")
+
+# Helper: explicitly print kable objects so knitr captures the rendered tables
+kbl_show <- function(x){
+  print(x)
+  invisible(x)
+}
+
+# Helper: resolve the data file path when the raw data are stored *outside* the
+# current analysis folder (e.g., the data file sits next to this folder).
+#
+# Edit `candidate_dirs` below if your project uses a different layout.
+resolve_data_path <- function(
+  filename,
+  candidate_dirs = c(
+    "..",
+    "../data", "../datasets", "../raw", "../input",
+    "../Data", "../DATA",
+    "../..", "../../data", "../../datasets",
+    ".",  # fallback (legacy): same folder as this Rmd
+    "./data"
+  )
+){
+  paths <- unique(file.path(candidate_dirs, filename))
+  hit <- paths[file.exists(paths)]
+  if(length(hit) > 0) return(hit[1])
+
+  stop(
+    paste0(
+      "Data file not found: ", filename, "
+",
+      "Searched the following locations (in order):
+",
+      paste0(" - ", normalizePath(paths, winslash = "/", mustWork = FALSE), collapse = "
+")
+    )
+  )
+}
+```
+
+# Dependencies and data
+```{r packages}
+need <- c("tidyverse","janitor","glmmTMB","emmeans","MASS","parameters","kableExtra","patchwork","gghalves","pBrackets")
+to_install <- setdiff(need, rownames(installed.packages()))
+if(length(to_install))
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+
+suppressPackageStartupMessages({
+  library(tidyverse); library(janitor); library(glmmTMB)
+  library(emmeans);    library(MASS);   library(kableExtra)
+  library(patchwork);  library(gghalves); 
+  library(parameters); library(pBrackets)
+})
+
+## ---------- Utility functions ----------
+coalesce_col <- function(df, patterns, new){
+  hit <- names(df)[stringr::str_detect(
+    names(df),
+    stringr::regex(paste0("(", paste(patterns, collapse="|"), ")"),
+                   ignore_case = TRUE))]
+  if(length(hit)==0) return(df)
+  dplyr::rename(df, !!new := dplyr::all_of(hit[1]))
+}
+
+safe_AIC <- function(mod){
+  if(is.null(mod) || inherits(mod, "try-error")) return(Inf)
+  out <- tryCatch(AIC(mod), error = function(e) NA_real_)
+  if(is.na(out)) Inf else out
+}
+```
+
+
+```{r}
+# ---------- Load and clean data ----------
+data_file <- resolve_data_path(params$data_path)
+raw <- readr::read_csv(data_file, show_col_types = FALSE) %>%
+         janitor::clean_names()
+
+df <- raw %>%
+  coalesce_col(c("^participant$","participantid","^subject$","subject",
+                 "^subj$","^pid$","^ppid$"), "participant") %>%
+  coalesce_col(c("^group$","condition","interact","arm"), "group") %>%
+  coalesce_col(c("^complexity$","path_complex","task_complexity","simple|complex"), "complexity") %>%
+  coalesce_col(c("^strategy_?div$","click.*strategy","kendall","tau","order.*dev"), "strategy_div")
+
+## If 'participant' is still missing, create a placeholder column
+if(!"participant" %in% names(df)){
+  warning("Participant ID column not found; created a dummy 'participant' column.")
+  df$participant <- seq_len(nrow(df))
+}
+
+## Type conversion and basic validation
+df <- df %>%
+  mutate(
+    participant = factor(participant),
+    group = forcats::fct_relabel(factor(group), \(x)
+              ifelse(stringr::str_detect(x, regex("2D", ignore_case = TRUE)),
+                     "2D+3D","3D-only")) |> forcats::fct_relevel("3D-only","2D+3D"),
+    complexity = forcats::fct_relabel(factor(complexity), \(x)
+              ifelse(stringr::str_detect(x, regex("complex", ignore_case = TRUE)),
+                     "complex","simple")) |> forcats::fct_relevel("simple","complex"),
+    strategy_div = as.numeric(strategy_div)
+  )
+
+df$y0 <- as.integer(df$strategy_div == 0)
+pos   <- dplyr::filter(df, strategy_div > 0)
+```
+
+# Model fitting: one-step ZIB and two-step approach
+```{r}
+ctrl <- glmmTMBControl(optimizer = optim,
+                       optArgs  = list(method = "BFGS"))
+
+# -- One-step ZIB: use the best model selected in 02 (best_ZIB = "ZIB_int")
+ZIB_best <- try(
+  glmmTMB(strategy_div ~ group*complexity + (1|participant),
+          ziformula   = ~ group*complexity + (1|participant),
+          dispformula = ~ 1,
+          data = df, family = beta_family(link="logit"), control = ctrl),
+  silent = TRUE)
+
+if(inherits(ZIB_best, "try-error")){
+  warning("The selected ZIB model did not converge; one-step ZIB outputs will be skipped.")
+  ZIB_best <- NULL
+}
+
+# -- Two-step: zero/non-zero component; best_zero = "L1" (from 02)
+L_best <- try(
+  glmmTMB(y0 ~ group*complexity + (1|participant),
+          data = df, family = binomial(), control = ctrl),
+  silent = TRUE)
+if(inherits(L_best, "try-error"))
+  stop("The zero/non-zero (hurdle) component did not converge.")
+
+# -- Two-step: positive component; best_pos = "M2a" (Beta, random intercept; from 02)
+P_best <- try(
+  glmmTMB(strategy_div ~ group*complexity + (1|participant),
+          data = pos, family = beta_family(link="logit"), control = ctrl),
+  silent = TRUE)
+
+if(inherits(P_best, "try-error")){
+  message("M2a (Beta) 未收敛，退回 Gamma(log) 同一随机结构。")
+  P_best <- glmmTMB(strategy_div ~ group*complexity + (1|participant),
+                    data = pos, family = Gamma(link="log"), control = ctrl)
+  pos_family <- "Gamma"
+} else {
+  pos_family <- "Beta"
+}
+```
+
+## Tab 2 — Fixed-effects summary（Main models）
+
+```{r tab2_fixef_zib, results='asis', message=FALSE, warning=FALSE}
+fe_table <- function(fit, component=NULL, reference="3D-only × simple", digits=3){
+  if (!requireNamespace("parameters", quietly = TRUE)) install.packages("parameters", repos="https://cloud.r-project.org")
+  suppressPackageStartupMessages({ library(parameters); library(dplyr) })
+  if(inherits(fit, "glmmTMB")){
+    comp <- if(is.null(component)) "conditional" else component
+    tab <- parameters::model_parameters(fit, component = comp, ci_method = "wald", verbose = FALSE)
+  } else {
+    tab <- parameters::model_parameters(fit, ci_method = "wald", verbose = FALSE)
+  }
+  stat_col <- if("z" %in% names(tab)) "z" else if("t" %in% names(tab)) "t" else if("Statistic" %in% names(tab)) "Statistic" else names(tab)[1]
+  out <- tab %>% dplyr::transmute(
+    Term = Parameter, `β` = Coefficient, SE = SE,
+    Stat = .data[[stat_col]], p = p,
+    `95% CI` = sprintf("[%.3f, %.3f]", CI_low, CI_high)
+  )
+  kableExtra::kable(out, digits = digits,
+    caption = paste0("Fixed-effects — ", deparse(substitute(fit)),
+                     if(!is.null(component)) paste0(" [", component, "]") else "", 
+                     " — reference: ", reference)) %>% 
+    kableExtra::kable_styling(full_width = FALSE)
+}
+
+
+# ========== Fixed Effects Table of Overall (E[y]) (Main Effects × Interaction) ==========
+fe_table_overall <- function(fit, reference="3D-only × simple", digits=3, include_intercept = TRUE){
+  if (is.null(fit)) return(invisible(NULL))
+  suppressPackageStartupMessages({ library(dplyr); library(knitr); library(kableExtra) })
+
+  cells <- expand.grid(group = c("3D-only","2D+3D"),
+                       complexity = c("simple","complex")) %>%
+    dplyr::mutate(group      = factor(group,      levels = c("3D-only","2D+3D")),
+                  complexity = factor(complexity, levels = c("simple","complex")),
+                  cell       = paste(group, complexity, sep = "·"))
+
+  pr0 <- predict(fit, newdata = cells, type = "zprob",       se.fit = TRUE, re.form = NA)
+  mu  <- predict(fit, newdata = cells, type = "conditional", se.fit = TRUE, re.form = NA)
+
+  Ey   <- (1 - pr0$fit) * mu$fit
+  seEy <- sqrt(((1 - pr0$fit)^2) * (mu$se.fit^2) + (mu$fit^2) * (pr0$se.fit^2))
+
+  A_mean <- Ey[cells$cell == "3D-only·simple"];  A_se <- seEy[cells$cell == "3D-only·simple"]
+  B_mean <- Ey[cells$cell == "3D-only·complex"]; B_se <- seEy[cells$cell == "3D-only·complex"]
+  C_mean <- Ey[cells$cell == "2D+3D·simple"];    C_se <- seEy[cells$cell == "2D+3D·simple"]
+  D_mean <- Ey[cells$cell == "2D+3D·complex"];   D_se <- seEy[cells$cell == "2D+3D·complex"]
+
+  beta_group    <- ((C_mean + D_mean)/2) - ((A_mean + B_mean)/2)
+  se_group      <- sqrt((C_se^2 + D_se^2 + A_se^2 + B_se^2) / 4)
+
+  beta_complex  <- ((B_mean + D_mean)/2) - ((A_mean + C_mean)/2)
+  se_complex    <- sqrt((B_se^2 + D_se^2 + A_se^2 + C_se^2) / 4)
+
+  beta_inter    <- (D_mean - B_mean) - (C_mean - A_mean)
+  se_inter      <- sqrt(D_se^2 + B_se^2 + C_se^2 + A_se^2)
+
+  out <- dplyr::tibble(
+    Term   = c("Group (2D+3D vs 3D-only)",
+               "Complexity (complex vs simple)",
+               "Interaction"),
+    `β`    = c(beta_group, beta_complex, beta_inter),
+    SE     = c(se_group,   se_complex,   se_inter),
+    Stat   = c(beta_group/se_group, beta_complex/se_complex, beta_inter/se_inter),
+    p      = 2*pnorm(abs(c(beta_group/se_group, beta_complex/se_complex, beta_inter/se_inter)), lower.tail = FALSE),
+    `95% CI` = sprintf("[%.3f, %.3f]",
+                       c(beta_group, beta_complex, beta_inter) - 1.96*c(se_group, se_complex, se_inter),
+                       c(beta_group, beta_complex, beta_inter) + 1.96*c(se_group, se_complex, se_inter))
+  )
+
+  if (isTRUE(include_intercept)) {
+    intercept_row <- dplyr::tibble(
+      Term = "(Intercept) = E[y | 3D-only × simple]",
+      `β` = A_mean, SE = A_se,
+      Stat = A_mean / A_se,
+      p = 2*pnorm(abs(A_mean / A_se), lower.tail = FALSE),
+      `95% CI` = sprintf("[%.3f, %.3f]", A_mean - 1.96*A_se, A_mean + 1.96*A_se)
+    )
+    out <- dplyr::bind_rows(intercept_row, out)
+  }
+
+  kableExtra::kable(out, digits = digits,
+    caption = "Single-step ZIB (Overall: unconditional E[y]): Wald tests for main effects and interactions of Group/Complexity (and optional intercept) (Source: mean difference / difference-in-differences of 2x2 E[y])") %>%
+    kableExtra::kable_styling(full_width = FALSE) %>% print()
+  invisible(out)
+}
+
+if(!is.null(ZIB_best)){
+  fe_table_overall(ZIB_best)
+  fe_table(ZIB_best, component="zi")
+}
+if(exists("L_best")) fe_table(L_best, component="conditional")
+if(exists("P_best")) fe_table(P_best, component="conditional")
+```
+
+
+## Forest data — standardized effects (Std. β)
+
+```{r forest_std_zib, results='asis', message=FALSE, warning=FALSE}
+# Required packages
+pkgs <- c("parameters","effectsize","insight","dplyr","knitr")
+for(p in pkgs) if(!requireNamespace(p, quietly=TRUE)) install.packages(p, repos="https://cloud.r-project.org")
+suppressPackageStartupMessages({ library(parameters); library(effectsize); library(insight); library(dplyr); library(knitr) })
+
+std_table <- function(fit, terms = c("group2D+3D","complexitycomplex","group2D+3D:complexitycomplex"), component=NULL){
+  # Try refit-based standardization first
+  tab <- NULL
+  try({
+    if(inherits(fit,"glmmTMB")){
+      tab <- effectsize::standardize_parameters(fit, method="refit",
+                                                component=if(is.null(component)) "conditional" else component, ci=0.95)
+    } else {
+      tab <- effectsize::standardize_parameters(fit, method="refit", ci=0.95)
+    }
+  }, silent = TRUE)
+
+  recode_label <- c("group2D+3D"="Group (2D+3D vs 3D-only)",
+                    "complexitycomplex"="Complexity (complex vs simple)",
+                    "group2D+3D:complexitycomplex"="Interaction")
+
+  use_refit <- !is.null(tab)
+  if(use_refit){
+    df <- as.data.frame(tab)
+    # Keep only requested terms; if Std_Coefficient is all NA, fall back
+    if(all(is.na(df$Std_Coefficient[df$Parameter %in% terms]))){
+      use_refit <- FALSE
+    } else {
+      df <- df %>% 
+        rename(
+          CI_low = ifelse("CI_low_Std" %in% colnames(.), "CI_low_Std", "CI_low"),
+          CI_high = ifelse("CI_high_Std" %in% colnames(.), "CI_high_Std", "CI_high")
+        )
+      out <- df[df$Parameter %in% terms, , drop=FALSE]
+      out <- out %>%
+        dplyr::transmute(Effect = dplyr::recode(Parameter, !!!recode_label),
+                         `Std. β` = Std_Coefficient,
+                         `CI low`  = CI_low,  
+                         `CI high` = CI_high) 
+      return(out)
+    }
+  }
+
+  # Fallback path: Wald CI on model scale -> standardize via beta * SD(col in model matrix) / SD(Y)
+  raw <- parameters::model_parameters(fit,
+          component = if(inherits(fit,"glmmTMB")) "conditional" else NULL,
+          ci_method = "wald")
+  raw <- as.data.frame(raw)
+  raw <- raw[raw$Parameter %in% terms, , drop=FALSE]
+
+  # SD(Y) from data
+  mf <- insight::get_data(fit, verbose=FALSE)
+  resp <- insight::find_response(fit)
+  SDy <- stats::sd(mf[[resp]], na.rm=TRUE)
+
+  # Use *model matrix* so column names match coefficient labels
+  mm <- try(insight::get_modelmatrix(fit, component = "conditional"), silent = TRUE)
+  if(inherits(mm, "try-error") || is.null(mm)){
+    mm <- try(stats::model.matrix(stats::formula(fit), data = mf), silent = TRUE)
+  }
+
+  get_sdx <- function(param){
+    if(!is.null(mm) && !inherits(mm, "try-error") && param %in% colnames(mm)){
+      return(stats::sd(mm[, param], na.rm=TRUE))
+    }
+    # Last resort: approximate using predictor variance if column can't be found
+    varname <- sub(":.*", "", sub("(.*?)(\\w+)$", "\\1\\2", param))
+    if(!is.null(mf[[varname]])){
+      x <- mf[[varname]]
+      ux <- stats::na.omit(unique(x))
+      if(length(ux)==2 && all(sort(ux) %in% c(0,1))) {
+        p <- mean(x, na.rm=TRUE); return(sqrt(p*(1-p)))
+      }
+      return(stats::sd(x, na.rm=TRUE))
+    }
+    return(NA_real_)
+  }
+
+  sdx <- vapply(raw$Parameter, get_sdx, numeric(1))
+  out <- raw %>%
+    dplyr::transmute(Effect = dplyr::recode(Parameter, !!!recode_label),
+                     `Std. β` = Coefficient * sdx / SDy,
+                     `CI low` = CI_low     * sdx / SDy,
+                     `CI high`= CI_high    * sdx / SDy)
+  return(out)
+}
+
+
+# ========== The standardized effect of Overall (E[y]) ==========
+std_table_overall <- function(fit, dv_name = "strategy_div") {
+  stopifnot(!is.null(fit))
+  suppressPackageStartupMessages({ library(dplyr); library(tibble) })
+
+  have_outZ <- exists("outZ", envir = .GlobalEnv)
+  if (isTRUE(have_outZ)) {
+    oz <- get("outZ", envir = .GlobalEnv)
+    need_cols <- c("cell","E[y]","lo","hi")
+    if (!all(need_cols %in% names(oz))) have_outZ <- FALSE
+  }
+
+  if (isTRUE(have_outZ)) {
+    cells <- oz %>% dplyr::arrange(match(cell, c("3D-only·simple","3D-only·complex","2D+3D·simple","2D+3D·complex")))
+    Ey   <- cells[["E[y]"]]
+    seEy <- (cells$hi - cells$lo) / (2*1.96)
+    names(Ey)   <- cells$cell
+    names(seEy) <- cells$cell
+  } else {
+    cells <- expand.grid(group = c("3D-only","2D+3D"),
+                         complexity = c("simple","complex"),
+                         KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+    cells$group      <- factor(cells$group,      levels = c("3D-only","2D+3D"))
+    cells$complexity <- factor(cells$complexity, levels = c("simple","complex"))
+    cells$cell       <- paste(cells$group, cells$complexity, sep = "·")
+
+    pr0 <- predict(fit, newdata = cells, type = "zprob",       se.fit = TRUE, re.form = NA)
+    mu  <- predict(fit, newdata = cells, type = "conditional", se.fit = TRUE, re.form = NA)
+    Ey   <- (1 - pr0$fit) * mu$fit
+    seEy <- sqrt(((1 - pr0$fit)^2) * (mu$se.fit^2) + (mu$fit^2) * (pr0$se.fit^2))
+    names(Ey)   <- cells$cell
+    names(seEy) <- cells$cell
+  }
+
+  if (anyNA(seEy)) {
+    seEy[is.na(seEy)] <- 0
+  }
+
+  A_mean <- Ey["3D-only·simple"];  A_se <- seEy["3D-only·simple"]
+  B_mean <- Ey["3D-only·complex"]; B_se <- seEy["3D-only·complex"]
+  C_mean <- Ey["2D+3D·simple"];    C_se <- seEy["2D+3D·simple"]
+  D_mean <- Ey["2D+3D·complex"];   D_se <- seEy["2D+3D·complex"]
+
+  beta_group    <- ((C_mean + D_mean)/2) - ((A_mean + B_mean)/2)
+  se_group      <- sqrt((C_se^2 + D_se^2 + A_se^2 + B_se^2) / 4)
+  beta_complex  <- ((B_mean + D_mean)/2) - ((A_mean + C_mean)/2)
+  se_complex    <- sqrt((B_se^2 + D_se^2 + A_se^2 + C_se^2) / 4)
+  beta_inter    <- (D_mean - B_mean) - (C_mean - A_mean)
+  se_inter      <- sqrt(D_se^2 + B_se^2 + C_se^2 + A_se^2)
+
+  betas <- c(beta_group, beta_complex, beta_inter)
+  ses   <- c(se_group,   se_complex,   se_inter)
+
+  if (!exists("df", envir = .GlobalEnv)) stop("Cannot find the cleaned df")
+  data_for_sd <- get("df", envir = .GlobalEnv) %>%
+    mutate(group = factor(group, levels = c("3D-only","2D+3D")),
+           complexity = factor(complexity, levels = c("simple","complex")))
+
+  if (!dv_name %in% names(data_for_sd)) stop(sprintf("Cannot find the DV column in the df '%s'", dv_name))
+  y_vec <- suppressWarnings(as.numeric(data_for_sd[[dv_name]]))
+  SDy   <- stats::sd(y_vec, na.rm = TRUE)
+  if (!is.finite(SDy) || SDy == 0) stop("SD(y) used for standardization is invalid (NA/Inf/0), please check the DV column")
+
+  # Model matrix
+  mm <- stats::model.matrix(~ group*complexity, data = data_for_sd)
+  want <- c("group2D+3D","complexitycomplex","group2D+3D:complexitycomplex")
+  miss <- setdiff(want, colnames(mm))
+  if (length(miss)) stop("The matrix is missing a column：", paste(miss, collapse = ", "))
+
+  sdx <- apply(mm[, want, drop = FALSE], 2, stats::sd, na.rm = TRUE)
+  if (any(!is.finite(sdx))) stop("SD(x) results in NA/Inf")
+
+  mult <- as.numeric(sdx) / SDy   
+
+  labels <- c("Group (2D+3D vs 3D-only)",
+              "Complexity (complex vs simple)",
+              "Interaction")
+
+  out <- tibble(
+    Effect   = labels,
+    `Std. β` = as.numeric(betas) * mult,
+    `CI low`  = (as.numeric(betas) - 1.96 * ses) * mult,
+    `CI high` = (as.numeric(betas) + 1.96 * ses) * mult
+  )
+  out$Effect <- as.character(out$Effect)
+  out
+}
+
+print(std_table_overall(ZIB_best, dv_name = "strategy_div"))
+
+mm <- model.matrix(~ group*complexity, data = df)
+print(apply(mm[, c("group2D+3D","complexitycomplex","group2D+3D:complexitycomplex")], 2, sd, na.rm = TRUE))
+print(sd(df$strategy_div, na.rm = TRUE))
+
+# --- Forest (merge zi& overall) ---
+forest_df_zi <- std_table(ZIB_best, component = "zi") %>%
+  dplyr::select(Effect, `Std. β`, `CI low`, `CI high`) %>%
+  dplyr::mutate(Component = "zi (Pr[y=0])",
+                Effect = as.character(Effect))
+
+forest_df_overall <- std_table_overall(ZIB_best, dv_name = "strategy_div") %>%
+  dplyr::mutate(Component = "overall (E[y])",
+                Effect = as.character(Effect))
+
+forest_df <- dplyr::bind_rows(forest_df_overall, forest_df_zi) %>%
+  dplyr::select(Component, Effect, `Std. β`, `CI low`, `CI high`)
+
+knitr::kable(
+  forest_df, digits = 3,
+  caption = "Forest data — standardized effects (Std. β with 95% CI; components: zi = Pr[y=0], overall = unconditional E[y]; baseline = 3D-only × simple)"
+)
+```
+
+# ZIB：Pr(0),E[y\|y>0],E[y]
+```{r}
+cells <- expand.grid(group = c("3D-only","2D+3D"),
+                     complexity = c("simple","complex")) %>%
+  mutate(group      = factor(group,      levels = c("3D-only","2D+3D")),
+         complexity = factor(complexity, levels = c("simple","complex")),
+         cell       = paste(group, complexity, sep = "·"))
+
+if(!is.null(ZIB_best)){
+  # ---- 1) Indicator estimation：Pr(y = 0)、E[y|y>0] 、 E[y] ----
+  pr0 <- predict(ZIB_best, newdata = cells,
+                 type = "zprob",       se.fit = TRUE, re.form = NA)
+  mu  <- predict(ZIB_best, newdata = cells,
+                 type = "conditional", se.fit = TRUE, re.form = NA)
+
+  Ey   <- (1 - pr0$fit) * mu$fit
+  seEy <- sqrt(((1 - pr0$fit)^2) * (mu$se.fit^2) +
+               (mu$fit^2)        * (pr0$se.fit^2))
+
+  outZ <- tibble(
+    cell        = cells$cell,
+    `Pr(y=0)`   = pr0$fit,
+    `E[y|y>0]`  = mu$fit,
+    `E[y]`      = Ey,
+    lo          = Ey - 1.96 * seEy,
+    hi          = Ey + 1.96 * seEy
+  )
+
+  kbl_show(
+    knitr::kable(outZ, digits = 3,
+      caption = "Single-Step ZIB: Four-Condition Estimation（Pr(y=0)、E[y|y>0]、E[y]）") %>%
+      kableExtra::kable_styling(full_width = FALSE)
+  )
+
+  # ---- 2) Overall Effect Test  Pairwise Comparison (ZIB Single-Step Model)----
+  emm_ZIB_cond <- try(
+    emmeans(ZIB_best, ~ group*complexity,
+            component = "cond", type = "response"),
+    silent = TRUE)
+
+  if(!inherits(emm_ZIB_cond, "try-error")){
+    joint_ZIB_cond <- joint_tests(emm_ZIB_cond)
+
+    kbl_show(
+      knitr::kable(as.data.frame(joint_ZIB_cond), digits = 3,
+            caption = "Single-step ZIB (cond component): overall Wald test for group/complexity/interaction (E[y|y>0])") %>%
+        kableExtra::kable_styling(full_width = FALSE)
+    )
+
+    kbl_show(
+      knitr::kable(summary(emm_ZIB_cond), digits = 3,
+            caption = "Single-step ZIB (cond component): Four-condition marginal means (E[y|y>0], reference cell = 3D-only·simple)") %>%
+        kableExtra::kable_styling(full_width = FALSE)
+    )
+
+    kbl_show(
+      knitr::kable(summary(pairs(emm_ZIB_cond)), digits = 3,
+            caption = "Single-step ZIB (cond component): pairwise comparison of four conditions (E[y|y>0])") %>%
+        kableExtra::kable_styling(full_width = FALSE)
+    )
+  } else {
+    cat("The current version of emmeans does not support component = 'cond', and only reports point estimates of E[y|y>0]。\n")
+  }
+
+  emm_ZIB_zero <- try(
+    emmeans(ZIB_best, ~ group*complexity,
+            component = "zi", type = "response"),
+    silent = TRUE)
+
+  if(!inherits(emm_ZIB_zero, "try-error")){
+    joint_ZIB_zero <- joint_tests(emm_ZIB_zero)
+
+    kbl_show(
+      knitr::kable(as.data.frame(joint_ZIB_zero), digits = 3,
+            caption = "Single-step ZIB (zi component): overall Wald test for group/complexity/interaction (Pr(y=0))") %>%
+        kableExtra::kable_styling(full_width = FALSE)
+    )
+
+    kbl_show(
+      knitr::kable(summary(emm_ZIB_zero), digits = 3,
+            caption = "Single-step ZIB (zi component): four-condition marginal means (Pr(y=0), reference cell = 3D-only·simple)") %>%
+        kableExtra::kable_styling(full_width = FALSE)
+    )
+
+    kbl_show(
+      knitr::kable(summary(pairs(emm_ZIB_zero)), digits = 3,
+            caption = "Single-step ZIB (zi component): pairwise comparison of four conditions (Pr(y=0))") %>%
+        kableExtra::kable_styling(full_width = FALSE)
+    )
+  } else {
+    cat("The current version of emmeans does not support component = 'zi' and only reports point estimates for Pr(y=0).\n")
+  }
+
+} else {
+  cat("ZIB is unavailable or has not converged, skipping this part.\n")
+}
+```
+
+
+
+## ZIB Single Step: Strategy Difference Raincloud plot(E[y])
+
+```{r ZIB_raincloud, fig.height=7, fig.width=7}
+if(is.null(ZIB_best)){
+  cat("The ZIB single-step model is not available, so the rainfall cloud map cannot be drawn.\n")
+} else {
+
+  # Marginal mean of E[y] (from outZ in the previous section)
+  emm_ct_df <- outZ %>%
+    dplyr::mutate(
+      group = factor(sub("·.*", "", cell), levels = c("3D-only","2D+3D")),
+      complexity = factor(sub(".*·", "", cell), levels = c("simple","complex"))
+    ) %>%
+    dplyr::transmute(
+      group, complexity,
+      time_sec  = `E[y]`,
+      lower_sec = lo,
+      upper_sec = hi
+    )
+
+  # Trial-level raw data: strategy variability
+  dat_ct_raw <- df %>%
+    dplyr::select(participant, group, complexity, strategy_div) %>%
+    dplyr::rename(time_sec = strategy_div)
+
+
+# ---------- color ----------
+col_blue <- "#3E69B0"  # 3D-only
+col_red  <- "#C61B21"  # 2D+3D
+
+# ---------- Data range ----------
+y_raw_min <- min(dat_ct_raw$time_sec, emm_ct_df$lower_sec, na.rm = TRUE)
+y_raw_max <- max(dat_ct_raw$time_sec, emm_ct_df$upper_sec, na.rm = TRUE)
+
+y_breaks_all  <- pretty(c(y_raw_min, y_raw_max), n = 5)
+y_breaks_used <- y_breaks_all
+
+y_axis_min <- min(y_breaks_used)
+y_axis_max <- max(y_breaks_used)
+dy         <- y_axis_max - y_axis_min
+
+y_plot_min <- y_axis_min - 0.30 * dy
+y_plot_max <- y_axis_max + 0.05 * dy
+
+x_simple  <- 1
+x_complex <- 2
+x_rng     <- x_complex - x_simple
+
+x_plot_min <- x_simple - 0.7
+x_plot_max <- x_complex + 0.5
+
+y_axis_x  <- x_simple - 0.35      
+y_tick_x1 <- y_axis_x               
+y_tick_x2 <- y_axis_x - 0.05        
+
+x_axis_y  <- y_axis_min - 0.08 * dy      
+x_tick_y1 <- x_axis_y                   
+x_tick_y2 <- x_axis_y - 0.04 * dy         
+
+# =====================================================================
+# raincloud plot
+# =====================================================================
+p_ct_raincloud <- ggplot() +
+
+  # ===== simple  =====
+  gghalves::geom_half_violin(
+    data = dat_ct_raw %>% filter(complexity == "simple", group == "3D-only"),
+    aes(x = as.numeric(complexity), y = time_sec,
+        fill = group, colour = group),
+    side = "l", width = 0.4, trim = TRUE,
+    alpha = 0.35, linewidth = 0.9
+  ) +
+  gghalves::geom_half_violin(
+    data = dat_ct_raw %>% filter(complexity == "simple", group == "2D+3D"),
+    aes(x = as.numeric(complexity), y = time_sec,
+        fill = group, colour = group),
+    side = "l", width = 0.4, trim = TRUE,
+    alpha = 0.35, linewidth = 0.9
+  ) +
+  geom_point(
+    data = dat_ct_raw %>% filter(complexity == "simple"),
+    aes(x = as.numeric(complexity) + 0.10, y = time_sec, colour = group),
+    position = position_jitter(width = 0.05, height = 0, seed = 2025),
+    alpha = 0.6, shape = 16, size = 2.2
+  ) +
+  geom_boxplot(
+    data = dat_ct_raw %>% filter(complexity == "simple", group == "3D-only"),
+    aes(x = as.numeric(complexity) + 0.25, y = time_sec,
+        fill = group, colour = group),
+    width = 0.08,
+    alpha = 0.25, outlier.shape = NA, linewidth = 0.9
+  ) +
+  geom_boxplot(
+    data = dat_ct_raw %>% filter(complexity == "simple", group == "2D+3D"),
+    aes(x = as.numeric(complexity) + 0.35, y = time_sec,
+        fill = group, colour = group),
+    width = 0.08,
+    alpha = 0.25, outlier.shape = NA, linewidth = 0.9
+  ) +
+
+  # ===== complex  =====
+  gghalves::geom_half_violin(
+    data = dat_ct_raw %>% filter(complexity == "complex", group == "3D-only"),
+    aes(x = as.numeric(complexity), y = time_sec,
+        fill = group, colour = group),
+    side = "r", width = 0.4, trim = TRUE,
+    alpha = 0.35, linewidth = 0.9
+  ) +
+  gghalves::geom_half_violin(
+    data = dat_ct_raw %>% filter(complexity == "complex", group == "2D+3D"),
+    aes(x = as.numeric(complexity), y = time_sec,
+        fill = group, colour = group),
+    side = "r", width = 0.4, trim = TRUE,
+    alpha = 0.35, linewidth = 0.9
+  ) +
+  geom_point(
+    data = dat_ct_raw %>% filter(complexity == "complex"),
+    aes(x = as.numeric(complexity) - 0.10, y = time_sec, colour = group),
+    position = position_jitter(width = 0.05, height = 0, seed = 2025),
+    alpha = 0.6, shape = 16, size = 2.2
+  ) +
+  geom_boxplot(
+    data = dat_ct_raw %>% filter(complexity == "complex", group == "3D-only"),
+    aes(x = as.numeric(complexity) - 0.35, y = time_sec,
+        fill = group, colour = group),
+    width = 0.08,
+    alpha = 0.25, outlier.shape = NA, linewidth = 0.9
+  ) +
+  geom_boxplot(
+    data = dat_ct_raw %>% filter(complexity == "complex", group == "2D+3D"),
+    aes(x = as.numeric(complexity) - 0.25, y = time_sec,
+        fill = group, colour = group),
+    width = 0.08,
+    alpha = 0.25, outlier.shape = NA, linewidth = 0.9
+  ) +
+
+  # ===== EMM =====
+  geom_line(
+  data = emm_ct_df,
+  aes(
+    x = as.numeric(complexity) + case_when(
+      group == "3D-only" & complexity == "simple" ~ 0.25,  
+      group == "2D+3D" & complexity == "simple" ~ 0.35,  
+      group == "3D-only" & complexity == "complex" ~ -0.35, 
+      group == "2D+3D" & complexity == "complex" ~ -0.25  
+    ),
+    y = time_sec,
+    group = group,
+    colour = group
+  ),
+  linewidth = 1.1
+) +
+geom_errorbar(
+  data = emm_ct_df,
+  aes(
+    x = as.numeric(complexity) + case_when(
+      group == "3D-only" & complexity == "simple" ~ 0.25,
+      group == "2D+3D" & complexity == "simple" ~ 0.35,
+      group == "3D-only" & complexity == "complex" ~ -0.35,
+      group == "2D+3D" & complexity == "complex" ~ -0.25
+    ),
+    ymin = lower_sec, ymax = upper_sec,
+    group = group, colour = group
+  ),
+  width = 0, linewidth = 1.1
+) +
+geom_point(
+  data = emm_ct_df,
+  aes(
+    x = as.numeric(complexity) + case_when(
+      group == "3D-only" & complexity == "simple" ~ 0.25,
+      group == "2D+3D" & complexity == "simple" ~ 0.35,
+      group == "3D-only" & complexity == "complex" ~ -0.35,
+      group == "2D+3D" & complexity == "complex" ~ -0.25
+    ),
+    y = time_sec,
+    group = group,
+    fill = group,
+    colour = group
+  ),
+  shape = 23, size = 3.0, stroke = 1.0
+) +
+  stat_summary(
+    data = dat_ct_raw,
+    aes(
+      x = as.numeric(complexity) + dplyr::case_when(
+        group == "3D-only" & complexity == "simple"  ~  0.25,
+        group == "2D+3D"  & complexity == "simple"  ~  0.35,
+        group == "3D-only" & complexity == "complex" ~ -0.35,
+        group == "2D+3D"  & complexity == "complex" ~ -0.25
+      ),
+      y     = time_sec,
+      colour = group,
+      group  = interaction(group, complexity) 
+    ),
+    fun.min = min,      
+    fun.max = max,      
+    geom    = "errorbar",
+    width   = 0.07,    
+    linewidth = 0.9
+  )+
+
+  # =================================================================
+  # Custom Axis
+  # =================================================================
+  geom_segment(
+    inherit.aes = FALSE,
+    aes(x = y_axis_x, xend = y_axis_x,
+        y = y_axis_min, yend = y_axis_max),
+    linewidth = 0.7
+  ) +
+  geom_segment(
+    inherit.aes = FALSE,
+    data = data.frame(y = y_breaks_used),
+    aes(x = y_tick_x1, xend = y_tick_x2,
+        y = y, yend = y),
+    linewidth = 0.7
+  ) +
+
+
+  geom_segment(
+    inherit.aes = FALSE,
+    aes(x = x_simple, xend = x_complex,
+        y = x_axis_y, yend = x_axis_y),
+    linewidth = 0.7
+  ) +
+  geom_segment(
+    inherit.aes = FALSE,
+    data = data.frame(x = c(x_simple, x_complex)),
+    aes(x = x, xend = x,
+        y = x_tick_y1, yend = x_tick_y2),
+    linewidth = 0.7
+  ) +
+
+  # =================================================================
+  # Manually draw scale numbers and axis titles near the new axis
+  # =================================================================
+
+  geom_text(
+    inherit.aes = FALSE,
+    data = data.frame(
+      y     = y_breaks_used,
+      label = y_breaks_used
+    ),
+    aes(x = y_axis_x - 0.15, y = y, label = label),
+    hjust = 0, vjust = 0.5, size = 3.5
+  ) +
+
+  geom_text(
+    inherit.aes = FALSE,
+    data = data.frame(
+      x     = c(x_simple, x_complex),
+      label = c("Simple", "Complex")
+    ),
+    aes(x = x, y = x_tick_y2 - 0.03 * dy, label = label),
+    vjust = 1, size = 3.5
+  ) +
+
+  geom_text(
+    inherit.aes = FALSE,
+    aes(x = y_axis_x - 0.3,
+        y = (y_axis_min + y_axis_max) / 2,
+        label = "Strategy divergence"),
+    angle = 90, hjust = 0.5, vjust = 0.5, size = 4
+  ) +
+
+  geom_text(
+    inherit.aes = FALSE,
+    aes(x = (x_simple + x_complex) / 2,
+        y = x_tick_y2 - 0.10 * dy,
+        label = "Complexity"),
+    vjust = 1, size = 4
+  ) +
+
+  scale_colour_manual(
+    values = c("3D-only" = col_blue,
+               "2D+3D"   = col_red),
+    name   = "Condition"
+  ) +
+  scale_fill_manual(
+    values = c("3D-only" = alpha(col_blue, 0.35),
+               "2D+3D"   = alpha(col_red,  0.35)),
+    name   = "Condition"
+  ) +
+
+  scale_y_continuous(
+    limits = c(y_plot_min, y_plot_max),
+    breaks = y_breaks_used
+  ) +
+  scale_x_continuous(
+    limits = c(x_plot_min, x_plot_max),
+    breaks = c(x_simple, x_complex),
+    labels = NULL   # 不用默认标签，自己画了
+  ) +
+
+  # ===== theme =====
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_blank(),   
+    panel.grid.minor   = element_blank(),
+    axis.text.x        = element_blank(),   
+    axis.text.y        = element_blank(),
+    axis.title.x       = element_blank(),  
+    axis.title.y       = element_blank(),
+    axis.ticks         = element_blank(),
+    axis.line          = element_blank(),
+    legend.position    = "top",
+    legend.title       = element_text(size = 11),
+    legend.margin      = margin(b = -5),
+    plot.margin        = margin(10, 25, 35, 45)
+  ) +
+  coord_cartesian(clip = "off")
+
+p_ct_raincloud
+
+}
+```
+
+# Two-step synthesis estimates
+
+```{r}
+emm_zero <- emmeans(L_best, ~ group*complexity, type = "response")
+emm_pos  <- emmeans(P_best, ~ group*complexity, type = "response")
+
+# ——Overall effect (Wald test, similar to factor ANOVA)——
+joint_zero <- joint_tests(emm_zero)
+joint_pos  <- joint_tests(emm_pos)
+
+kbl_show(
+  knitr::kable(as.data.frame(joint_zero), digits = 3,
+        caption = "Zero/Non-zero levels: Overall Wald test for group/complexity/interaction") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+)
+
+kbl_show(
+  knitr::kable(as.data.frame(joint_pos), digits = 3,
+        caption = "Level: Overall Wald Test for group / complexity / interaction") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+)
+
+# ——Estimates for four conditions  Pairwise comparisons between conditions——
+kbl_show(
+  knitr::kable(summary(emm_zero), digits = 3,
+        caption = "Zero/Non-zero layers: Marginal means of the four conditions (probability scale)") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+)
+
+kbl_show(
+  knitr::kable(summary(pairs(emm_zero)), digits = 3,
+        caption = "Zero/Non-zero Layers: Pairwise Comparison of Four Conditions (Probability Scale)") %>%
+    kableExtra::kable_styling(full_width = FALSE)
+)
+
+kbl_show(
+  knitr::kable(summary(emm_pos), digits = 3,
+        caption = paste0("Positive layer (", pos_family, "): the marginal mean of the four conditions (expected value scale)")) %>%
+    kableExtra::kable_styling(full_width = FALSE)
+)
+
+kbl_show(
+  knitr::kable(summary(pairs(emm_pos)), digits = 3,
+        caption = paste0("Positive Layer (", pos_family, "): Comparison of four conditions (expected value scale)")) %>%
+    kableExtra::kable_styling(full_width = FALSE)
+)
+```
+
+```{r}
+# ——Parameter sampling to synthesize the overall expected value E[y]——
+cells2 <- expand.grid(group = c("3D-only","2D+3D"),
+                      complexity = c("simple","complex")) %>%
+  mutate(
+    group = factor(group, levels = c("3D-only","2D+3D")),
+    complexity = factor(complexity, levels = c("simple","complex")),
+    cell = paste(group, complexity, sep = "·")
+  )
+
+X <- model.matrix(~ group*complexity, data = cells2)
+
+fix_L <- fixef(L_best)$cond
+V_L   <- as.matrix(vcov(L_best)$cond)
+
+fix_P <- fixef(P_best)$cond
+V_P   <- as.matrix(vcov(P_best)$cond)
+
+inv_logit <- function(eta) 1/(1+exp(-eta))
+
+B <- params$B
+set.seed(2025)
+bt_L <- MASS::mvrnorm(B, mu = fix_L, Sigma = V_L)
+bt_P <- MASS::mvrnorm(B, mu = fix_P, Sigma = V_P)
+
+p_zero <- inv_logit(bt_L %*% t(X))
+mu_pos <- if(pos_family == "Beta") inv_logit(bt_P %*% t(X)) else exp(bt_P %*% t(X))
+Ey <- (1 - p_zero) * mu_pos
+
+summ <- function(M, metric_name, cell_vec){
+  tibble(
+    metric = metric_name,
+    cell = cell_vec,
+    mean = apply(M, 2, mean),
+    lo = apply(M, 2, quantile, probs = .025),
+    hi = apply(M, 2, quantile, probs = .975)
+  )
+}
+
+out_zero <- summ(p_zero, "Pr(y=0)", cells2$cell)
+out_pos  <- summ(mu_pos, "E[y|y>0]", cells2$cell)
+out_all  <- summ(Ey, "E[y]", cells2$cell)
+
+res <- bind_rows(out_zero, out_pos, out_all) %>%
+  relocate(metric, cell, mean, lo, hi)
+
+kbl_show(
+  knitr::kable(res, digits = 3,
+        caption = paste0("Two-step synthesis: four-condition estimate and 95%（B = ", B, ")")) %>%
+    kableExtra::kable_styling(full_width = FALSE)
+)
+```
+
+# Comparison: ZIB vs Two-Step
+```{r}
+plot_df <- res %>%
+  filter(metric == "E[y]") %>%
+  mutate(source = "Two-step")
+
+if(!is.null(ZIB_best)){
+  pr0 <- predict(ZIB_best, newdata = cells, type = "zprob", re.form = NA)
+  mu  <- predict(ZIB_best, newdata = cells, type = "conditional", re.form = NA)
+  plot_df <- bind_rows(
+    plot_df,
+    tibble(cell = cells$cell,
+           mean = (1 - pr0) * mu,
+           lo = NA_real_, hi = NA_real_,
+           source = "ZIB")
+  )
+}
+
+ggplot(plot_df, aes(x = cell, y = mean, color = source, group = source)) +
+  geom_point(position = position_dodge(width = .3), size = 2) +
+  geom_line(position = position_dodge(width = .3)) +
+  theme_minimal() +
+  labs(x = NULL, y = "E[y]",
+       title = "Overall expected E[y]: ZIB single-step vs two-step synthesis (control)")
+```
+
+# Summary
+- **ZIB single-step** and **two-step** should be consistent in direction; in the report, choose one of the two to present as the main result;
+- Three types of indicators: `Pr(zero)`, `E[y|y>0]`, `E[y]`, with sensitivity analysis possible in the appendix.
+
+## 7. Strategy Divergence — Δ EMMs Forest (overall; integrated table + plot, aligned version)
+
+> Use the overall metric m = (1 - p0) * mu_plus (0–1), with the horizontal axis as Δ(B − A) and the reference line = 0; the plotting framework is exactly the same as CT/HM/Difficulty.
+
+```{r strategy_forest_overall_aligned, fig.width=10, fig.height=5, out.width='100%'}
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(forcats)
+  library(ggplot2); library(scales); library(glue); library(tibble); library(purrr)
+})
+
+# ===== Strategy Divergence (overall): m = (1 - p0) * mu_plus on 0–1 scale; report Δ (B - A), ref = 0 =====
+# Assumptions:
+# - ZIB_best exists earlier in the document.
+# - Factors match other DVs: group = {3D-only, 2D+3D}, complexity = {simple, complex}.
+
+cells <- tidyr::expand_grid(
+  group = factor(c("3D-only","2D+3D"), levels = c("3D-only","2D+3D")),
+  complexity = factor(c("simple","complex"), levels = c("simple","complex"))
+) %>%
+  dplyr::mutate(cell = paste(group, complexity, sep = "·"))
+
+stopifnot(exists("ZIB_best"))
+
+# 1) E[Y] and its SE via delta method (ignoring covariance between parts; conservative)
+pr0 <- predict(ZIB_best, newdata = cells, type = "zprob",       se.fit = TRUE, re.form = NA)
+mu  <- predict(ZIB_best, newdata = cells, type = "conditional", se.fit = TRUE, re.form = NA)
+
+m    <- (1 - pr0$fit) * mu$fit                        # overall expectation, 0–1
+se_m <- sqrt(((1 - pr0$fit)^2) * (mu$se.fit^2) + (mu$fit^2) * (pr0$se.fit^2))
+
+# Directly add the m and se columns to the cells dataframe without separately referencing the column names.
+m_tbl <- cells %>%
+  dplyr::mutate(
+    m = m,    # Overall Expectations
+    se = se_m # Standard Error
+  )
+
+# 2) Four contrasts (B − A), keep same order/labels as other DVs
+get_m  <- function(g, c) m_tbl$m [m_tbl$group==g & m_tbl$complexity==c]
+get_se <- function(g, c) m_tbl$se[m_tbl$group==g & m_tbl$complexity==c]
+
+contr_rows <- list(
+  list(Contrast="Simple Scenario",        Block="Condition Effect (2D+3D vs. 3D-only)",
+       A=list(g="3D-only", c="simple"), B=list(g="2D+3D", c="simple")),
+  list(Contrast="Complex Scenario",       Block="Condition Effect (2D+3D vs. 3D-only)",
+       A=list(g="3D-only", c="complex"), B=list(g="2D+3D", c="complex")),
+  list(Contrast=" 3D-only Condition",  Block="Complexity Effect (Complex vs. Simple)",
+       A=list(g="3D-only", c="simple"), B=list(g="3D-only", c="complex")),
+  list(Contrast=" 2D+3D Condition",    Block="Complexity Effect (Complex vs. Simple)",
+       A=list(g="2D+3D",   c="simple"), B=list(g="2D+3D",   c="complex"))
+)
+
+df_contr <- purrr::map_dfr(contr_rows, function(r){
+  mA  <- get_m(r$A$g, r$A$c);  mB  <- get_m(r$B$g, r$B$c)
+  seA <- get_se(r$A$g, r$A$c); seB <- get_se(r$B$g, r$B$c)
+  delta <- mB - mA
+  se    <- sqrt(seA^2 + seB^2)        # conservative (no covariance)
+  z     <- delta / se
+  p     <- 2 * pnorm(-abs(z))
+  tibble(Contrast = r$Contrast, Block = r$Block,
+         delta = delta, low = delta - 1.96*se, high = delta + 1.96*se,
+         p_raw = p,
+         # For left table A|B display: show B | A to match other DVs
+         a_m = mB, b_m = mA)
+}) %>%
+  dplyr::mutate(p_holm = p.adjust(p_raw, method = "holm"))
+
+# 3) Vertical layout (identical to CT/HM/Difficulty)
+row_order <- c("Simple Scenario", "Complex Scenario",
+               " 3D-only Condition", " 2D+3D Condition")
+
+gap_within_block1 <- 0.20; gap_between_blocks <- 0.60; gap_within_block2 <- 0.20
+y1 <- 0.3; y2 <- y1 - gap_within_block1; y3 <- y2 - gap_between_blocks; y4 <- y3 - gap_within_block2
+row_y <- c("Simple Scenario"=y1,"Complex Scenario"=y2," 3D-only Condition"=y3," 2D+3D Condition"=y4)
+row_map <- tibble(Contrast = factor(names(row_y), levels = row_order),
+                  y = as.numeric(row_y[as.character(Contrast)]))
+
+df_contr <- df_contr %>%
+  dplyr::mutate(Contrast = factor(Contrast, levels = row_order)) %>%
+  dplyr::left_join(row_map, by = "Contrast") %>%
+  dplyr::arrange(dplyr::desc(y))
+
+y_top    <- max(row_map$y); y_bottom <- min(row_map$y)
+
+# 4) Left table columns (same positions), but labels in raw 0–1 scale
+col_x <- c("Contrast" = 0.15, "EMMs A|B" = 1.45,
+           "Mean Diff. [95% CI]" = 2.25, "p (Holm)" = 3.35)
+xlim_tbl <- c(0.05, 3.6)
+
+# Forest area region on same canvas
+forest_gap_x <- 0.40; forest_width <- 2.20
+x_forest_min <- xlim_tbl[2] + forest_gap_x
+x_forest_max <- x_forest_min + forest_width
+
+# 5) Forest x-range on 0–1 units (Δ), with reference line at 0
+xr_raw <- range(c(df_contr$low, df_contr$high), na.rm = TRUE)
+pad    <- max(diff(xr_raw) * 0.06, 0.02)
+xlim_for <- c(xr_raw[1] - pad, xr_raw[2] + pad)
+
+choose_step <- function(rng, target_ticks = 4){
+  width <- diff(rng); cand <- c(0.02, 0.05, 0.10, 0.20)
+  cand[which.min(abs(width/cand - target_ticks))]
+}
+step <- choose_step(xlim_for, 4)
+low  <- floor(xlim_for[1]/step) * step
+high <- ceiling(xlim_for[2]/step) * step
+x_breaks_for <- seq(low, high, by = step)
+if (xlim_for[1] <= 0 && xlim_for[2] >= 0) x_breaks_for <- sort(unique(c(x_breaks_for, 0)))
+
+xf <- function(x) scales::rescale(x, to = c(x_forest_min, x_forest_max), from = xlim_for)
+
+df_contr <- df_contr %>%
+  dplyr::mutate(x_low = xf(low), x_high = xf(high), x_mid = xf(delta))
+
+x_ticks <- tibble(brk = x_breaks_for, x = xf(x_breaks_for))
+tick_lab <- scales::label_number(accuracy = step)(x_ticks$brk)
+
+# 6) Headers / thick line / section labels (unchanged)
+header_text_y   <- y_top + 0.65
+header_line_gap <- 0.08
+header_line_y   <- header_text_y - header_line_gap
+
+header_df <- tibble(x = unname(col_x), y = header_text_y, label = names(col_x))
+sec_offset_top <- 0.20; sec_offset_bottom <- 0.20
+sec_labels <- tibble(
+  label = c("Condition Effect (2D+3D vs. 3D-only)", "Complexity Effect (Complex vs. Simple)"),
+  y     = c(row_y["Simple Scenario"] + sec_offset_top,
+            row_y[" 3D-only Condition"] + sec_offset_bottom),
+  x     = unname(col_x["Contrast"])
+)
+
+body_dy <- 0.15
+df_contr  <- df_contr  %>% dplyr::mutate(y = y + body_dy)
+sec_labels <- sec_labels %>% dplyr::mutate(y = y + body_dy)
+
+# 7) Bottom axis and dashed line at 0
+axis_gap <- 0.15; axis_y <- y_bottom - axis_gap
+tick_up <- 0.08; tick_down <- 0.06; tick_label_gap <- 0.28; tick_label_y <- axis_y - tick_label_gap
+
+ylims_lower <- axis_y - (tick_label_gap + tick_down + 0.18)
+ylims_upper <- y_top + 1.90
+ylims <- c(ylims_lower, ylims_upper)
+
+vline_df <- if (xlim_for[1] <= 0 && xlim_for[2] >= 0) tibble(x = xf(0)) else tibble(x = numeric(0))
+
+# 8) Left table values (three decimals for 0–1 units)
+tbl_show <- df_contr %>%
+  dplyr::transmute(
+    Contrast, y,
+    `EMMs A|B` = sprintf("%s | %s",
+                         format(round(a_m, 3), nsmall = 3),
+                         format(round(b_m, 3), nsmall = 3)),
+    `Mean Diff. [95% CI]` = sprintf("%.3f [%.3f, %.3f]", delta, low, high),
+    `p (Holm)` = ifelse(p_holm < .001, "< .001", format(round(p_holm, 3), nsmall = 3))
+  ) %>%
+  tidyr::pivot_longer(cols = c("Contrast","EMMs A|B","Mean Diff. [95% CI]","p (Holm)"),
+                      names_to = "col", values_to = "val") %>%
+  dplyr::mutate(x = unname(col_x[col]), is_bold = (col == "Contrast"))
+
+# 9) Single-canvas draw (layout identical to CT/HM/Difficulty)
+ggplot() +
+  geom_text(data = sec_labels, aes(x = x, y = y, label = label),
+            hjust = 0, vjust = 0, fontface = "bold", size = 4) +
+  geom_text(data = tbl_show,
+            aes(x = x, y = y, label = val, fontface = ifelse(is_bold,"bold","plain"), colour = "black"),
+            hjust = 0, vjust = 0.5, size = 3.6, lineheight = 1.0) +
+  geom_text(data = header_df, aes(x = x, y = y, label = label),
+            hjust = 0, vjust = 0, size = 3.7, fontface = "bold") +
+  scale_colour_identity() +
+  geom_segment(aes(x = -Inf, xend = Inf, y = header_line_y, yend = header_line_y), linewidth = 1.0) +
+  geom_segment(data = df_contr, aes(x = x_low, xend = x_high, y = y, yend = y), linewidth = 0.9) +
+  geom_point(data = df_contr, aes(x = x_mid, y = y), size = 2.8) +
+  geom_segment(data = vline_df, aes(x = x, xend = x), y = axis_y, yend = header_line_y,
+               linetype = "dashed", linewidth = 0.6) +
+  annotate("text", x = x_forest_min, y = header_text_y, label = "Mean Diff. [95% CI]",
+           hjust = -0.8, vjust = 0, size = 3.7, fontface = "bold") +
+  geom_segment(data = x_ticks, aes(x = x, xend = x, y = axis_y - tick_down, yend = axis_y + tick_up),
+               linewidth = 0.6, lineend = "butt") +
+  geom_text(data = x_ticks, aes(x = x, y = tick_label_y, label = tick_lab), vjust = 1, size = 3.2) +
+  annotate("segment", x = x_forest_min-0.1, xend = x_forest_max, y = axis_y, yend = axis_y, linewidth = 1.0, lineend = "square") +
+  coord_cartesian(xlim = c(xlim_tbl[1], x_forest_max + 0.05), ylim = c(ylims[1], ylims[2]), clip = "on") +
+  theme_minimal(base_size = 12) +
+  theme(axis.title = element_blank(), axis.text = element_blank(),
+        panel.grid = element_blank(), plot.margin = margin(t = 6, r = 6, b = 6, l = 4))
+```

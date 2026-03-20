@@ -1,0 +1,153 @@
+---
+title: "Click strategy deviation (strategy_div): Data exploration and diagnostics"
+author: "CongLiu"
+params:
+  data_path: "Experimental_Raw_Data.csv"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    word_document: default
+    pdf_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.8,
+                      fig.align = "center", dpi = 300,
+                      out.width = "90%")
+set.seed(2025)
+```
+
+# 0. Packages and helper functions
+
+```{r}
+need <- c("tidyverse","janitor","glue","ggpubr","patchwork","kableExtra","scales","moments")
+to_install <- setdiff(need, rownames(installed.packages()))
+if(length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+suppressPackageStartupMessages({library(tidyverse); library(janitor); library(glue); library(ggpubr); library(patchwork); library(kableExtra); library(scales); library(moments)})
+
+coalesce_col <- function(df, patterns, new){
+  hit <- names(df)[stringr::str_detect(names(df), stringr::regex(paste0("(", paste(patterns, collapse="|"), ")"), ignore_case=TRUE))]
+  if(length(hit) == 0) return(df)
+  dplyr::rename(df, !!new := dplyr::all_of(hit[1]))
+}
+
+# ---- Data path resolution (recommended for reproducibility) ----
+resolve_data_path <- function(path,
+                              candidate_dirs = c("..", "../data", "../datasets", "../dataset",
+                                                 "../raw", "../raw_data", "../input", "../inputs"),
+                              must_exist = TRUE) {
+  # If `path` exists as provided (absolute or relative), use it directly.
+  if (!is.null(path) && nzchar(path) && file.exists(path)) {
+    return(normalizePath(path, winslash = "/", mustWork = FALSE))
+  }
+
+  # Otherwise, search common sibling / parent directories.
+  fname <- basename(path)
+  candidates <- unique(c(fname, file.path(candidate_dirs, fname)))
+  hit <- candidates[file.exists(candidates)][1]
+
+  if (is.na(hit) || is.null(hit)) {
+    msg <- paste0(
+      "Data file not found. Tried the following locations:\n",
+      paste(candidates, collapse = "\n")
+    )
+    if (must_exist) stop(msg, call. = FALSE) else return(NA_character_)
+  }
+
+  normalizePath(hit, winslash = "/", mustWork = FALSE)
+}
+
+data_file <- resolve_data_path(params$data_path)
+
+```
+
+# 1. Data import and harmonization
+
+```{r}
+raw <- readr::read_csv(data_file, show_col_types = FALSE) %>% janitor::clean_names()
+
+df <- raw %>%
+  coalesce_col(c("^participant$","^subj","^pid","^ppid"), "participant") %>%
+  coalesce_col(c("^group$","condition","interact","arm"), "group") %>%
+  coalesce_col(c("^complexity$","path_complex","task_complexity","simple|complex"), "complexity") %>%
+  coalesce_col(c("^strategy_?div$","click.*strategy","kendall","tau","order.*dev"), "strategy_div") %>%
+  dplyr::mutate(
+    participant = as.factor(participant),
+    # Note: ignore_case is handled inside regex() for robustness
+    group = forcats::fct_relabel(as.factor(group), 
+                                 \(x) ifelse(stringr::str_detect(x, regex("2D", ignore_case=TRUE)),
+                                             "2D+3D", "3D-only")) |> 
+            forcats::fct_relevel("3D-only","2D+3D"),
+    # Same robustness adjustment for complexity recoding
+    complexity = forcats::fct_relabel(as.factor(complexity), 
+                                     \(x) ifelse(stringr::str_detect(x, regex("complex", ignore_case=TRUE)),
+                                                 "complex", "simple")) |>
+                 forcats::fct_relevel("simple","complex"),
+    cell = interaction(group, complexity, sep = "·"),
+    strategy_div = as.numeric(strategy_div)
+  )
+
+stopifnot(all(c("participant","group","complexity","strategy_div") %in% names(df)))
+
+summary_tbl <- tibble(
+  rows = nrow(df),
+  participants = dplyr::n_distinct(df$participant),
+  min = min(df$strategy_div, na.rm=TRUE),
+  max = max(df$strategy_div, na.rm=TRUE)
+)
+knitr::kable(summary_tbl, caption="Sample size and range (strategy_div)") %>% kable_styling(full_width=FALSE)
+```
+
+# 2. Missingness and basic distributions
+
+```{r}
+mis <- sapply(df, \(x) sum(is.na(x)))
+knitr::kable(tibble(var=names(mis), missing=as.integer(mis)), caption="Missingness check") %>% kable_styling(full_width=FALSE)
+
+p_all <- ggplot(df, aes(strategy_div)) + geom_histogram(bins=30) + theme_minimal() + ggtitle("Distribution of strategy_div (including zeros)")
+p_pos <- ggplot(dplyr::filter(df, strategy_div>0), aes(strategy_div)) + geom_histogram(bins=30) + theme_minimal() + ggtitle("Distribution of strategy_div (positive values only)")
+p_all / p_pos
+```
+
+# 3. Zero proportion by experimental cell
+
+```{r}
+zero_rate <- mean(df$strategy_div == 0, na.rm=TRUE)
+zero_by <- df %>% group_by(group, complexity) %>% summarise(zero_rate = mean(strategy_div==0), n=dplyr::n(), .groups="drop")
+knitr::kable(zero_by, digits=3, caption=glue("Zero proportion by cell (overall zero rate = {round(zero_rate, 3)})")) %>% kable_styling(full_width=FALSE)
+
+ggplot(zero_by, aes(x=complexity, y=zero_rate, fill=group)) +
+  geom_col(position=position_dodge(width=.6), width=.55) +
+  scale_y_continuous(labels=scales::percent_format(accuracy=1)) +
+  labs(y="Pr(strategy_div = 0)", x=NULL, title="Proportion of fully in-order responses (strategy_div = 0) by cell") +
+  theme_minimal()
+```
+
+# 4. Positive values (y > 0): distribution and mean–variance relationship
+
+```{r}
+pos <- df %>% filter(strategy_div>0)
+desc <- pos %>% summarise(min=min(strategy_div), max=max(strategy_div), mean=mean(strategy_div), sd=sd(strategy_div),
+                          skew= moments::skewness(strategy_div), kurt_excess= moments::kurtosis(strategy_div) - 3)
+knitr::kable(desc, digits=3, caption="Descriptive statistics for positive values (strategy_div > 0)") %>% kable_styling(full_width=FALSE)
+
+# Inspect mean–variance relationship via quantile binning
+cuts <- quantile(pos$strategy_div, probs = seq(0,1,length.out=11))
+cuts[1] <- cuts[1] - 1e-9
+cats <- cut(pos$strategy_div, cuts, include.lowest=TRUE)
+mv <- pos %>% mutate(bin=cats) %>% group_by(bin) %>% summarise(mean=mean(strategy_div), var=var(strategy_div), .groups="drop")
+knitr::kable(mv, digits=4, caption="Mean–variance diagnostics for positive values (binned)") %>% kable_styling(full_width=FALSE)
+
+ggplot(mv, aes(mean, var)) + geom_point(size=2) + theme_minimal() + labs(title="Mean vs variance (positive values; supports Gamma/Beta families)")
+```
+
+# 5. Key takeaways (exploratory)
+- `strategy_div` is a deviation metric in **[0, 1)**; **0 has a structural interpretation** (fully in-order).
+- The **zero proportion differs across experimental cells**, motivating a separate model for **Pr(y = 0)**.
+- Among positive values, a **positive mean–variance association** suggests **Beta (logit link)** or **Gamma (log link)** for the conditional distribution.
+- Downstream model comparisons consider **(i) single-stage ZIB** and **(ii) two-part hurdle** formulations in parallel.

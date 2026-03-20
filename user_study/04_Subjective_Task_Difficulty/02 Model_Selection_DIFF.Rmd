@@ -1,0 +1,163 @@
+---
+title: "Difficulty: Model Selection (Gaussian LMM vs. CLMM)"
+author: "CongLiu"
+params:
+  data_path: "Experimental_Raw_Data.csv"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5,
+  fig.align = "center",
+  dpi = 300,
+  out.width = "90%"
+)
+options(width = 120)
+set.seed(2025)
+```
+
+```{r data_paths, echo=FALSE}
+# -------------------------------------------------------------------
+# Data path helper
+# - By default, looks for the data file outside the current analysis folder.
+# - Edit `candidate_dirs` if your project uses a different directory layout.
+# -------------------------------------------------------------------
+locate_data_file <- function(fname){
+  if (is.null(fname) || !nzchar(fname)) stop("`data_path` is empty.")
+  # 1) Use as-is if it already exists (absolute or relative to current working dir)
+  if (file.exists(fname)) return(fname)
+
+  candidate_dirs <- c(
+    "..",
+    "../data",
+    "../datasets",
+    "../raw",
+    "../input",
+    "../../data",
+    "../../datasets"
+  )
+
+  tried <- c(file.path(getwd(), fname))
+  for (d in candidate_dirs){
+    f <- file.path(d, fname)
+    tried <- c(tried, file.path(getwd(), f))
+    if (file.exists(f)) return(f)
+  }
+
+  stop(
+    "Data file not found: ", fname, "\n",
+    "Tried the following locations (relative to the current working directory):\n  - ",
+    paste(tried, collapse = "\n  - ")
+  )
+}
+```
+
+
+# 0. Packages and data
+
+```{r}
+need <- c("tidyverse","janitor","lme4","emmeans","broom.mixed","performance","ordinal","knitr","kableExtra")
+to_install <- setdiff(need, rownames(installed.packages()))
+if(length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+
+suppressPackageStartupMessages({
+  library(tidyverse); library(janitor); library(lme4); library(emmeans); library(broom.mixed)
+  library(performance); library(ordinal); library(knitr); library(kableExtra)
+})
+
+data_file <- locate_data_file(params$data_path)
+df <- readr::read_csv(data_file, show_col_types = FALSE) %>% janitor::clean_names() %>%
+  dplyr::rename_with(~"participant", matches("^participant$|^subj|^pid|^ppid", ignore.case=TRUE)) %>%
+  dplyr::rename_with(~"group", matches("^group$|condition|interact|arm", ignore.case=TRUE)) %>%
+  dplyr::rename_with(~"complexity", matches("^complexity$|path_complex|task_complexity|simple|complex", ignore.case=TRUE)) %>%
+  dplyr::rename_with(~"difficulty", matches("^difficulty$|^diff_rating$|difficulty_score|^diff$", ignore.case=TRUE)) %>%
+  dplyr::mutate(
+    participant = factor(participant),
+    group = ifelse(grepl("2D", group, ignore.case=TRUE), "2D+3D", "3D-only"),
+    group = factor(group, levels=c("3D-only","2D+3D")),
+    complexity = ifelse(grepl("complex", complexity, ignore.case=TRUE), "complex", "simple"),
+    complexity = factor(complexity, levels=c("simple","complex")),
+    cell = interaction(group, complexity, sep=":"),
+    difficulty = as.numeric(difficulty),
+    difficulty_ord = ordered(difficulty)  # for CLMM
+  )
+
+summary(df$difficulty)
+```
+
+# 1. Candidate models
+
+```{r}
+# M0: Gaussian LMM, random intercept (primary candidate)
+M0 <- lme4::lmer(difficulty ~ group*complexity + (1|participant), data=df, REML=FALSE)
+
+# M1: Gaussian LMM, random intercept + random slope for complexity
+M1 <- try(lme4::lmer(difficulty ~ group*complexity + (1 + complexity|participant), data=df, REML=FALSE), silent=TRUE)
+
+# M2: CLMM (ordinal mixed model), random intercept (participant)
+M2 <- ordinal::clmm(difficulty_ord ~ group*complexity + (1|participant), data=df, link = "logit", Hess = TRUE)
+```
+
+# 2. Information criteria and singularity checks
+
+```{r}
+get_info_lmer <- function(m, label){
+  if(inherits(m,"try-error")) return(tibble(Model=label, Type="Gaussian LMM", logLik=NA, AIC=NA, BIC=NA, Singular=NA))
+  tibble(
+    Model = label,
+    Type = "Gaussian LMM",
+    logLik = as.numeric(logLik(m)),
+    AIC = AIC(m),
+    BIC = BIC(m),
+    Singular = performance::check_singularity(m)  # returns TRUE/FALSE
+  )
+}
+
+# Other functions and code unchanged
+get_info_clmm <- function(m, label){
+  tibble(
+    Model = label,
+    Type = "CLMM (ordinal)",
+    logLik = as.numeric(logLik(m)),
+    AIC = AIC(m),
+    BIC = BIC(m),
+    Singular = NA
+  )
+}
+
+# Rebuild the summary table (subsequent code unchanged)
+tab <- dplyr::bind_rows(
+  get_info_lmer(M0, "M0: Gaussian LMM (RI)"),
+  get_info_lmer(M1, "M1: Gaussian LMM (RI+RS)"),
+  get_info_clmm(M2, "M2: CLMM (RI)")
+) %>% arrange(AIC)
+
+kable(tab, digits=2, caption="Candidate models for Difficulty: logLik/AIC/BIC and singularity") %>% 
+  kable_styling(full_width=FALSE)
+```{r DIFF_diag, fig.width=10, fig.height=12, out.width="100%", dpi=300}
+  performance::check_model(M0)
+```
+
+
+
+# 3. Rationale and selection principles (LMM vs. CLMM)
+
+- **Gaussian LMM:** treats Difficulty as approximately continuous; given the near-symmetric distribution and acceptable residual/variance diagnostics, this is the primary analysis choice.  
+- **Random slope (M1):** if `Singular = TRUE` or AIC/BIC do not improve, between-participant variability in the simple–complex contrast is limited; a random-intercept model is sufficient.  
+- **CLMM (M2):** respects the ordinal nature of Likert responses and is used for **sensitivity analysis**. Information criteria can be inspected, but the key check is whether effect directions and inferential conclusions align with the LMM.  
+
+In the subsequent reporting document (03):  
+- the default primary model is **M0 Gaussian LMM (random intercept)**;  
+- **M2 CLMM** is additionally fitted and reported as sensitivity analysis.
+

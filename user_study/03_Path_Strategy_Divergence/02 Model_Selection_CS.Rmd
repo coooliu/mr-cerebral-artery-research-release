@@ -1,0 +1,231 @@
+---
+title: "Click strategy deviation (strategy_div): Model selection and evaluation (single-stage ZIB vs two-part hurdle)"
+author: "CongLiu"
+params:
+  data_path: "Experimental_Raw_Data.csv"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    word_document: default
+    pdf_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.8,
+                      fig.align = "center", dpi = 300,
+                      out.width = "90%")
+set.seed(2025)
+```
+
+# 0. Packages
+```{r}
+need <- c("tidyverse","janitor","glmmTMB","DHARMa","emmeans",
+          "performance","broom.mixed","kableExtra","patchwork")
+to_install <- setdiff(need, rownames(installed.packages()))
+if(length(to_install))
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+
+suppressPackageStartupMessages({
+  library(tidyverse);  library(janitor);   library(glmmTMB)
+  library(DHARMa);     library(emmeans);   library(performance)
+  library(broom.mixed);library(kableExtra);library(patchwork)
+})
+
+# Helper functions
+coalesce_col <- function(df, patterns, new){
+  hit <- names(df)[stringr::str_detect(
+    names(df),
+    stringr::regex(paste0("(", paste(patterns, collapse="|"), ")"),
+                   ignore_case = TRUE))]
+  if(length(hit)==0) return(df)
+  dplyr::rename(df, !!new := dplyr::all_of(hit[1]))
+}
+
+# Fail-safe model fitting: capture errors and return NULL
+fit_safely <- function(expr)
+  tryCatch(expr, error = function(e){
+    message("⚠️ ", conditionMessage(e)); return(NULL)
+  })
+
+# Always return a comparable AIC value (Inf if unavailable)
+safe_AIC <- function(mod){
+  if(is.null(mod)) return(Inf)                         # fit failed
+  out <- tryCatch(AIC(mod), error = function(e) NA_real_)
+  if(is.na(out)) Inf else out                          # log-likelihood unavailable
+}
+
+# ---- Data path resolution (recommended for reproducibility) ----
+resolve_data_path <- function(path,
+                              candidate_dirs = c("..", "../data", "../datasets", "../dataset",
+                                                 "../raw", "../raw_data", "../input", "../inputs"),
+                              must_exist = TRUE) {
+  if (!is.null(path) && nzchar(path) && file.exists(path)) {
+    return(normalizePath(path, winslash = "/", mustWork = FALSE))
+  }
+  fname <- basename(path)
+  candidates <- unique(c(fname, file.path(candidate_dirs, fname)))
+  hit <- candidates[file.exists(candidates)][1]
+  if (is.na(hit) || is.null(hit)) {
+    msg <- paste0(
+      "Data file not found. Tried the following locations:\n",
+      paste(candidates, collapse = "\n")
+    )
+    if (must_exist) stop(msg, call. = FALSE) else return(NA_character_)
+  }
+  normalizePath(hit, winslash = "/", mustWork = FALSE)
+}
+
+data_file <- resolve_data_path(params$data_path)
+
+```
+
+# 1. Data import and preprocessing
+```{r}
+raw <- readr::read_csv(data_file, show_col_types = FALSE) %>% 
+         janitor::clean_names()
+
+df <- raw %>% 
+  coalesce_col(c("^participant$","^subj","^pid","^ppid"), "participant") %>% 
+  coalesce_col(c("^group$","condition","interact","arm"), "group") %>% 
+  coalesce_col(c("^complexity$","path_complex","task_complexity",
+                 "simple|complex"), "complexity") %>% 
+  coalesce_col(c("^strategy_?div$","click.*strategy","kendall",
+                 "tau","order.*dev"), "strategy_div") %>% 
+  mutate(
+    participant = as.factor(participant),
+    group = forcats::fct_relabel(as.factor(group), \(x)
+              ifelse(str_detect(x, regex("2D", ignore_case = TRUE)),
+                     "2D+3D","3D-only")) |> forcats::fct_relevel("3D-only","2D+3D"),
+    complexity = forcats::fct_relabel(as.factor(complexity), \(x)
+              ifelse(str_detect(x, regex("complex", ignore_case = TRUE)),
+                     "complex","simple")) |> forcats::fct_relevel("simple","complex"),
+    strategy_div = as.numeric(strategy_div)
+  )
+
+df$y0  <- as.integer(df$strategy_div == 0)
+pos    <- filter(df, strategy_div > 0)  # positive subset
+```
+
+# 2. Candidate models
+- **Single-stage (ZIB)**: `beta_family(link="logit")` + `ziformula`  
+- **Two-part (hurdle)**: (i) zero vs non-zero (binomial), then (ii) positive values (Gamma/Beta).
+
+# 3. Model fitting (with fail-safe wrappers)
+```{r}
+ctrl <- glmmTMBControl(optimizer = optim, optArgs = list(method = "BFGS"))
+
+# --- Single-stage ZIB ---
+ZIB_int   <- fit_safely(
+  glmmTMB(strategy_div ~ group*complexity + (1|participant),
+          ziformula   = ~ group*complexity + (1|participant),
+          dispformula = ~ 1,
+          data = df, family = beta_family(link="logit"),
+          control = ctrl))
+
+ZIB_slope <- fit_safely(
+  glmmTMB(strategy_div ~ group*complexity + (1+complexity|participant),
+          ziformula   = ~ group*complexity + (1|participant),
+          dispformula = ~ 1,
+          data = df, family = beta_family(link="logit"),
+          control = ctrl))
+
+# --- Two-part: zero vs non-zero ---
+L1 <- fit_safely(
+        glmmTMB(y0 ~ group*complexity + (1|participant),
+                data=df, family = binomial(), control=ctrl))
+L2 <- fit_safely(
+        glmmTMB(y0 ~ group*complexity + (1+complexity|participant),
+                data=df, family = binomial(), control=ctrl))
+
+# --- Two-part: positive component ---
+M1b <- fit_safely(
+        glmmTMB(strategy_div ~ group*complexity + (1|participant),
+                data=pos, family = Gamma(link="log"), control=ctrl))
+M1c <- fit_safely(
+        glmmTMB(strategy_div ~ group*complexity + (1+complexity|participant),
+                data=pos, family = Gamma(link="log"), control=ctrl))
+
+M2a <- fit_safely(
+        glmmTMB(strategy_div ~ group*complexity + (1|participant),
+                data=pos, family = beta_family(link="logit"), control=ctrl))
+M2b <- fit_safely(
+        glmmTMB(strategy_div ~ group*complexity + (1+complexity|participant),
+                data=pos, family = beta_family(link="logit"), control=ctrl))
+```
+
+# 4. Information criteria and diagnostics
+```{r}
+# --- AIC / BIC summary ---
+mods_single <- list(ZIB_int=ZIB_int, ZIB_slope=ZIB_slope)
+mods_zero   <- list(L1=L1, L2=L2)
+mods_pos    <- list(M1b=M1b, M1c=M1c, M2a=M2a, M2b=M2b)
+
+grab_ic <- function(lst){
+  map_dfr(names(lst), \(nm){
+    m <- lst[[nm]]
+    tibble(model = nm,
+           AIC  = if(is.null(m)) NA_real_ else AIC(m),
+           BIC  = if(is.null(m)) NA_real_ else BIC(m))
+  })
+}
+
+aic_single <- grab_ic(mods_single)
+aic_zero   <- grab_ic(mods_zero)
+aic_pos    <- grab_ic(mods_pos)
+
+# Optional: convert Inf to NA for presentation
+show_tbl <- function(x, cap){
+  kable(x %>% mutate(across(c(AIC,BIC), ~ ifelse(is.infinite(.), NA, .))),
+        digits = 2, caption = cap) %>%
+    kable_styling(full_width = FALSE)
+}
+show_tbl(aic_single, "Single-stage ZIB candidates (AIC/BIC)")
+show_tbl(aic_zero,   "Two-part: zero vs non-zero (binomial) candidates (AIC/BIC)")
+show_tbl(aic_pos,    "Two-part: positive component (Gamma/Beta) candidates (AIC/BIC)")
+```
+
+```{r}
+# --- DHARMa residual diagnostics (example; optional) ---
+safe_plot_res <- function(mod){
+  if(!is.null(mod))
+    try(plot(DHARMa::simulateResiduals(mod, n = 300, plot = FALSE)),
+        silent = TRUE)
+}
+safe_plot_res(ZIB_int)
+safe_plot_res(ZIB_slope)
+walk(list(M1b, M1c, M2a, M2b), safe_plot_res)
+```
+
+# 5. Automated recommendation
+```{r}
+# --- Single-stage ZIB ---
+best_ZIB  <- if(safe_AIC(ZIB_slope) < safe_AIC(ZIB_int))
+               "ZIB_slope" else "ZIB_int"
+
+# --- Zero vs non-zero ---
+best_zero <- if(safe_AIC(L2) < safe_AIC(L1)) "L2" else "L1"
+
+# --- Positive component ---
+cand_pos  <- list(M2b = M2b, M2a = M2a, M1c = M1c, M1b = M1b)
+scores    <- purrr::map_dbl(cand_pos, safe_AIC)
+
+best_pos <- if (all(is.infinite(scores))) {
+  NA_character_
+} else {
+  names(scores)[which.min(scores)]
+}
+
+tibble(best_ZIB = best_ZIB,
+       best_zero = best_zero,
+       best_pos = best_pos) %>%
+  kable(caption = "Automated recommendation (AIC-based heuristic)") %>%
+  kable_styling(full_width = FALSE)
+
+```{r SD_diag, fig.width=10, fig.height=12, out.width="100%", dpi=300}
+performance::check_model(ZIB_int)
+```

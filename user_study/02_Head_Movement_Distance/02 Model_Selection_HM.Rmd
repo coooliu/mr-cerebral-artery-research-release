@@ -1,0 +1,301 @@
+---
+title: "Head Movement: Model Selection (LMM / varIdent / Gamma-GLMM)"
+author: "CongLiu"
+params:
+  data_path: "Experimental_Raw_Data.csv"
+  select_by: "AICw"   # options: "AICw" or "Score"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5,
+  fig.align = "center",
+  dpi = 300,
+  out.width = "90%",
+  collapse = TRUE,
+  comment = "#>"
+)
+options(width = 120)
+set.seed(2025)
+
+# ------------------------------------------------------------------------------
+# Publication-ready data I/O helper
+#   - By default, the analysis looks for the data file *outside* this folder,
+#     e.g., in ../data/, ../datasets/, or the parent directory.
+#   - You can always override `params$data_path` with an absolute/relative path.
+# ------------------------------------------------------------------------------
+resolve_data_path <- function(
+  x,
+  candidate_dirs = c("../data", "../datasets", "../dataset", "../raw", "../input", "..")
+) {
+  if (!is.null(x) && nzchar(x) && file.exists(x)) return(x)
+
+  fname <- basename(x)
+  candidates <- unique(c(x, file.path(candidate_dirs, fname)))
+
+  for (p in candidates) {
+    if (!is.null(p) && nzchar(p) && file.exists(p)) return(p)
+  }
+
+  stop(
+    "Data file not found.
+",
+    "Provided: ", x, "
+",
+    "Checked paths:
+- ", paste(candidates, collapse = "
+- ")
+  )
+}
+```
+
+
+# Packages and data
+
+```{r}
+need <- c("tidyverse","janitor","lme4","nlme","glmmTMB","emmeans","broom.mixed","performance","insight","see","knitr","kableExtra")
+to_install <- setdiff(need, rownames(installed.packages()))
+if(length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+suppressPackageStartupMessages({
+  library(tidyverse); library(janitor); library(lme4); library(nlme); library(glmmTMB)
+  library(emmeans); library(broom.mixed); library(performance); library(insight); library(see)
+  library(knitr); library(kableExtra)
+})
+
+# Resolve data file location
+data_path <- resolve_data_path(params$data_path)
+df <- readr::read_csv(data_path, show_col_types = FALSE) %>% janitor::clean_names() %>%
+  rename_with(~"participant", matches("^participant$|^subj|^pid|^ppid", ignore.case=TRUE)) %>%
+  rename_with(~"group", matches("^group$|condition|interact|arm", ignore.case=TRUE)) %>%
+  rename_with(~"complexity", matches("^complexity$|path_complex|task_complexity|simple|complex", ignore.case=TRUE)) %>%
+  rename_with(~"head_move", matches("^head_?move|head.?movement|head.*mov|^hm$|head_move_dist", ignore.case=TRUE)) %>%
+  mutate(
+    participant = factor(participant),
+    # Use regex(ignore_case=TRUE) for stable behaviour under older stringr versions
+    group = factor(ifelse(str_detect(group, regex("2D", ignore_case=TRUE)), "2D+3D", "3D-only"),
+                   levels = c("3D-only","2D+3D")),
+    complexity = factor(ifelse(str_detect(complexity, regex("complex", ignore_case=TRUE)), "complex", "simple"),
+                        levels = c("simple","complex")),
+    cell = interaction(group, complexity, sep = ":")
+  ) %>%
+  mutate(head_move = as.numeric(head_move))
+
+# Ensure strictly positive values (required for Gamma family and log-transform)
+eps <- 0
+if(any(df$head_move <= 0, na.rm=TRUE)) eps <- abs(min(df$head_move, na.rm=TRUE)) + 1e-6
+df <- df %>% mutate(log_head_move = log(head_move + eps))
+```
+
+# Fit candidate models
+
+```{r models}
+# M0: Gaussian LMM on raw scale (baseline)
+M0 <- lme4::lmer(head_move ~ group*complexity + (1|participant), data=df, REML=FALSE)
+
+# M1: log-LMM (random intercept + random slope)
+M1 <- try(lme4::lmer(log_head_move ~ group*complexity + (1 + complexity|participant), data=df, REML=FALSE), silent=TRUE)
+
+# M1a: log-LMM (random intercept only)
+M1a <- lme4::lmer(log_head_move ~ group*complexity + (1|participant), data=df, REML=FALSE)
+
+# M2: log-LMM + varIdent (cell-specific residual variance)
+M2 <- nlme::lme(fixed = log_head_move ~ group*complexity,
+                random = ~1|participant, data=df, method="ML",
+                weights = nlme::varIdent(form = ~1|cell))
+
+# M3: Gamma GLMM (log link)
+M3 <- glmmTMB::glmmTMB(head_move ~ group*complexity + (1|participant),
+                       data=df, family=Gamma(link="log"))
+
+# M3b: Gamma GLMM + dispformula (cell-specific dispersion)
+M3b <- glmmTMB::glmmTMB(head_move ~ group*complexity + (1|participant),
+                        dispformula = ~ cell,
+                        data=df, family=Gamma(link="log"))
+```
+
+# Core model metrics (AIC weight / composite performance score / R² / RMSE / sigma)
+
+```{r compare}
+# Collect successfully fitted models
+mods <- list(M0=M0, M1=M1, M1a=M1a, M2=M2, M3=M3, M3b=M3b)
+ok <- !vapply(mods, inherits, logical(1), "try-error")
+mods <- mods[ok]
+
+# Basic information criteria
+aic <- sapply(mods, AIC)
+bic <- sapply(mods, BIC)
+ll  <- sapply(mods, logLik)
+
+# R² (marginal), RMSE, sigma
+get_r2m <- function(m){
+  # For mixed models, use Nakagawa R²
+  if (inherits(m, c("lmerMod", "lmerModLmerTest", "lme", "glmmTMB"))) {
+    r2 <- try(performance::r2_nakagawa(m), silent = TRUE)
+    if (inherits(r2, "try-error")) return(NA_real_)
+    return(unname(r2$R2_marginal))
+  }
+
+  # For models without random effects (e.g., lm/glm), use r2()
+  r2 <- try(performance::r2(m), silent = TRUE)
+  if (inherits(r2, "try-error")) return(NA_real_)
+  if ("R2_marginal" %in% names(r2)) return(unname(r2[["R2_marginal"]]))
+  if ("R2" %in% names(r2))        return(unname(r2[["R2"]]))
+  NA_real_
+}
+r2m   <- sapply(mods, get_r2m)
+
+get_rmse <- function(m){
+  rm <- try(performance::rmse(m), silent=TRUE)
+  if(inherits(rm, "try-error")) return(NA_real_)
+  # rmse() may return a vector or a data frame
+  if(is.list(rm) && "RMSE" %in% names(rm)) return(as.numeric(rm$RMSE))
+  as.numeric(rm)[1]
+}
+rmse  <- sapply(mods, get_rmse)
+
+get_sigma <- function(m){
+  s <- try(performance::sigma(m), silent=TRUE)
+  if(inherits(s, "try-error")) return(NA_real_)
+  as.numeric(s)[1]
+}
+sigma <- sapply(mods, get_sigma)
+
+# Singularity (only applicable to lmer models)
+sing <- sapply(mods, function(m){
+  if(inherits(m, "lmerMod") || inherits(m, "lmerModLmerTest")){
+    res <- try(performance::check_singularity(m), silent=TRUE)
+    if(inherits(res, "try-error")) return(NA)
+    if(is.atomic(res)) return(as.logical(res))
+    if(is.data.frame(res) && "is_singular" %in% colnames(res)) return(res$is_singular)
+  }
+  NA
+})
+
+# AIC weights
+deltaAIC <- aic - min(aic, na.rm=TRUE)
+aw <- exp(-0.5 * deltaAIC)
+AICw <- aw / sum(aw, na.rm=TRUE)
+
+# Composite performance score (0–100): min–max normalise each metric and combine with direction-aware weights
+# Direction: larger R² is better; smaller AIC/BIC/RMSE/sigma are better
+norm_minmax <- function(x, larger_better=TRUE){
+  if(all(is.na(x))) return(rep(NA_real_, length(x)))
+  xmin <- min(x, na.rm=TRUE); xmax <- max(x, na.rm=TRUE)
+  if(isTRUE(all.equal(xmin, xmax))) return(rep(1, length(x)))  # All values identical -> score = 1
+  if(larger_better){
+    (x - xmin) / (xmax - xmin)
+  } else {
+    (xmax - x) / (xmax - xmin)
+  }
+}
+w <- c(AIC=0.30, BIC=0.10, R2=0.30, RMSE=0.20, Sigma=0.10)  # adjust if needed
+score <- w["AIC"]  * norm_minmax(aic,  larger_better=FALSE) +
+         w["BIC"]  * norm_minmax(bic,  larger_better=FALSE) +
+         w["R2"]   * norm_minmax(r2m,  larger_better=TRUE)  +
+         w["RMSE"] * norm_minmax(rmse, larger_better=FALSE) +
+         w["Sigma"]* norm_minmax(sigma,larger_better=FALSE)
+ScorePct <- 100 * as.numeric(score)
+
+# Summary table (sorted by AIC weight and score)
+tab_metrics <- tibble::tibble(
+  Model = names(mods),
+  Class = vapply(mods, function(x) class(x)[1], character(1)),
+  logLik = as.numeric(ll),
+  AIC    = as.numeric(aic),
+  BIC    = as.numeric(bic),
+  AICw   = as.numeric(AICw),
+  R2_marginal = as.numeric(r2m),
+  RMSE   = as.numeric(rmse),
+  Sigma  = as.numeric(sigma),
+  Singular = as.logical(sing),
+  `Performance-Score(%)` = round(ScorePct, 2)
+) %>%
+  arrange(desc(AICw), desc(`Performance-Score(%)`))
+
+kable(tab_metrics, digits=3, caption="Key metrics for candidate models (incl. AIC weights and composite score)") %>% kable_styling(full_width=FALSE)
+```
+
+## `performance::compare_performance` (official comparison table with ranks)
+
+```{r perf_compare}
+comp <- performance::compare_performance(mods, rank = TRUE)
+
+# (1) Keep model names as a column (collision-safe)
+if (!"Model" %in% names(comp)) {
+  comp <- tibble::rownames_to_column(comp, "Model")
+}
+
+# (2) If `Rank`/`rank` is absent, generate it
+if (!any(c("Rank","rank") %in% names(comp))) {
+  comp <- comp %>% 
+    mutate(Rank = dplyr::row_number())          # Use current row order as Rank
+}
+
+# (3) Harmonise `rank`/`Rank` naming
+if ("rank" %in% names(comp) && !"Rank" %in% names(comp)) {
+  comp <- dplyr::rename(comp, Rank = rank)
+}
+
+comp2 <- comp %>% 
+  left_join(tab_metrics %>% 
+              dplyr::select(Model, AICw, `Performance-Score(%)`),
+            by = "Model") %>% 
+  arrange(Rank)                                  # Ensure Rank exists
+
+kable(comp2, digits = 3,
+      caption = "compare_performance + AIC weights + composite score") %>% 
+  kable_styling(full_width = FALSE)
+
+
+```
+
+# Automated “best model” selection with rationale
+
+```{r pick_best, results='asis'}
+best_by_AICw  <- tab_metrics %>% slice_max(AICw, n=1, with_ties = FALSE) %>% pull(Model)
+best_by_Score <- tab_metrics %>% slice_max(`Performance-Score(%)`, n=1, with_ties = FALSE) %>% pull(Model)
+
+best_choice <- if (tolower(params$select_by) == "score") best_by_Score else best_by_AICw
+best_row <- tab_metrics %>% filter(Model == best_choice)
+
+cat("**Selection criterion**: ", params$select_by, "<br/>",
+    "**Best by AIC weight**: ", best_by_AICw, "<br/>",
+    "**Best by composite score**: ", best_by_Score, "<br/>",
+    "**Final model used for downstream reporting**: ", best_choice, "<br/><br/>", sep="")
+
+kable(best_row, digits=3, caption = "Key metrics of the selected model") %>% kable_styling(full_width=FALSE)
+```
+
+# Diagnostics (quick check of residuals etc. for the selected model)
+
+```{r diag}
+best_mod <- mods[[ best_choice ]]
+# One-shot diagnostic plots (normality, heteroscedasticity, influence, fit)
+performance::check_model(best_mod)
+```
+
+# Add-on: information criteria table (for alignment with earlier versions)
+
+```{r aic_table}
+AICtab <- tab_metrics %>% select(Model, AIC, BIC, AICw, R2_marginal, RMSE, Sigma, Singular, `Performance-Score(%)`)
+kable(AICtab, digits=3, caption="Summary of information criteria and core metrics (incl. weights and score)") %>% kable_styling(full_width=FALSE)
+```
+
+# Summary and recommendations
+
+- **AIC weight (AICw)** reflects the relative probability that a model is best among the candidates; values closer to 1 indicate stronger support.  
+- **Performance score** is a weighted average (0–100) over normalised metrics (AIC/BIC/R²/RMSE/sigma). If you need the same weighting scheme as in the completion-time analysis, adjust `w` in the code.  
+- **Diagnostic plots** are recommended for inclusion in the report (or at least retained in the Supplement). Consider noting that the head-movement model choice was motivated by distributional/variance features and validated via AIC weights and the composite score.
+
