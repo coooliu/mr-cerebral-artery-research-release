@@ -3,7 +3,7 @@
 This repository contains the core implementation and demo assets for reproducing the research described in the manuscript:
 
 **Structured Dual-View Interactive Framework for Cerebral Artery Exploration in Mixed Reality: Integrating 2D Abstract Layouts and 3D Models**
-currently submitted to The Visual Computer.
+
 
 ## Overview
 
